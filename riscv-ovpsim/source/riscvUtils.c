@@ -371,7 +371,11 @@ void riscvSetMode(riscvP riscv, riscvMode mode) {
     riscvConsolidateFPFlags(riscv);
 
     // if executing in supervisor or user mode, include VM-enabled indication
-    if((mode!=RISCV_MODE_M) && (RD_CSR_FIELD_V(riscv, satp, V, MODE))) {
+    if(mode==RISCV_MODE_M) {
+        // no action
+    } else if(RD_CSR_FIELD_V(riscv, satp, V, MODE)) {
+        dMode |= RISCV_DMODE_VM;
+    } else if(V && RD_CSR_FIELD(riscv, hgatp, MODE)) {
         dMode |= RISCV_DMODE_VM;
     }
 

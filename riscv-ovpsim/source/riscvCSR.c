@@ -2251,7 +2251,16 @@ static RISCV_CSR_WRITEFN(mcyclehW) {
 // Common routine to read time
 //
 static Uns64 timeR(riscvP riscv) {
-    return (Uns64)(1000000*vmirtGetMonotonicTime((vmiProcessorP)riscv));
+
+    Uns64 result = 1000000 * vmirtGetMonotonicTime((vmiProcessorP)riscv);
+
+    // apply time delta in virtual mode (NOTE: use 64-bit CSR view because when
+    // RV32 state, htimedeltah is mapped to top half of this)
+    if(inVMode(riscv)) {
+        result += RD_CSR64(riscv, htimedelta);
+    }
+
+    return result;
 }
 
 //
@@ -2439,29 +2448,54 @@ static RISCV_CSR_WRITEFN(mhpmW) {
 ////////////////////////////////////////////////////////////////////////////////
 
 //
-// Write satp
+// Write satp or vsatp
 //
-static RISCV_CSR_WRITEFN(satpW) {
-
-    Uns64 old = RD_CSR(riscv, satp);
+static Uns64 atpW(
+    riscvCSRAttrsCP    attrs,
+    riscvP             riscv,
+    Uns64              newValue,
+    CSR_REG_TYPE(atp) *atpP,
+    Bool               isWARL
+) {
+    Uns64 old = RD_RAW(riscv, *atpP);
 
     // write value
-    WR_CSR(riscv, satp, newValue);
+    WR_RAW(riscv, *atpP, newValue);
 
     // mask ASID value to implemented width
     Uns32 ASIDmask = getASIDMask(riscv);
-    Uns32 ASID     = RD_CSR_FIELD(riscv, satp, ASID) & ASIDmask;
-    WR_CSR_FIELD(riscv, satp, ASID, ASID);
+    Uns32 ASID     = RD_RAW_FIELD(riscv, *atpP, ASID) & ASIDmask;
+    WR_RAW_FIELD(riscv, *atpP, ASID, ASID);
 
     // mask PPN value to implemented width
     Uns64 PPNMask = getAddressMask(riscv->extBits) >> RISCV_PAGE_SHIFT;
-    Uns64 PPN     = RD_CSR_FIELD(riscv, satp, PPN) & PPNMask;
-    WR_CSR_FIELD(riscv, satp, PPN, PPN);
+    Uns64 PPN     = RD_RAW_FIELD(riscv, *atpP, PPN) & PPNMask;
+    WR_RAW_FIELD(riscv, *atpP, PPN, PPN);
 
     // get requested mode
-    Uns32 targetMode = RD_CSR_FIELD(riscv, satp, MODE);
+    Uns32 targetMode = RD_RAW_FIELD(riscv, *atpP, MODE);
 
-    if(!((1<<targetMode) & riscv->configInfo.Sv_modes)) {
+    if((1<<targetMode) & riscv->configInfo.Sv_modes) {
+
+        // valid mode specified
+
+    } else if(isWARL) {
+
+        // use bare mode if invalid mode was specified (in which case all other
+        // fields read as zero)
+        if(riscv->verbose) {
+            vmiMessage("W", CPU_PREFIX"_ISBM",
+                SRCREF_FMT
+                "%s invalid mode %u specified - use bare mode",
+                SRCREF_ARGS(riscv, getPC(riscv)),
+                attrs->name, targetMode
+            );
+        }
+
+        // select bare mode
+        WR_RAW(riscv, *atpP, 0);
+
+    } else {
 
         // discard write if invalid mode was specified
         if(riscv->verbose) {
@@ -2474,70 +2508,90 @@ static RISCV_CSR_WRITEFN(satpW) {
         }
 
         // revert value
-        WR_CSR(riscv, satp, old);
+        WR_RAW(riscv, *atpP, old);
+    }
 
-    } else {
+    if(old!=RD_RAW(riscv, *atpP)) {
 
-        // change in SATP.MODE enables/disables VM
+        // change in *satp.MODE enables/disables VM
         riscvSetMode(riscv, getCurrentMode5(riscv));
 
-        // change in SATP.ASID affects effective ASID
+        // change in *satp.ASID affects effective ASID
         riscvVMSetASID(riscv);
     }
 
-    // return written value
-    return RD_CSR(riscv, satp);
+    return RD_RAW(riscv, *atpP);
+}
+
+//
+// Write satp
+//
+static RISCV_CSR_WRITEFN(satpW) {
+    return atpW(attrs, riscv, newValue, &riscv->csr.satp, False);
 }
 
 //
 // Write vsatp
 //
 static RISCV_CSR_WRITEFN(vsatpW) {
+    return atpW(attrs, riscv, newValue, &riscv->csr.vsatp, True);
+}
 
-    Uns64 old = RD_CSR(riscv, vsatp);
+//
+// Write hgatp
+//
+static RISCV_CSR_WRITEFN(hgatpW) {
+
+    Uns64 old = RD_CSR(riscv, hgatp);
 
     // write value
-    WR_CSR(riscv, vsatp, newValue);
+    WR_CSR(riscv, hgatp, newValue);
+    WR_CSR_FIELD(riscv, hgatp, _u1, 0);
 
-    // mask ASID value to implemented width
-    Uns32 ASIDmask = getASIDMask(riscv);
-    Uns32 ASID     = RD_CSR_FIELD(riscv, vsatp, ASID) & ASIDmask;
-    WR_CSR_FIELD(riscv, vsatp, ASID, ASID);
+    // mask VMID value to implemented width
+    Uns32 VMIDmask = getVMIDMask(riscv);
+    Uns32 VMID     = RD_CSR_FIELD(riscv, hgatp, VMID) & VMIDmask;
+    WR_CSR_FIELD(riscv, hgatp, VMID, VMID);
 
-    // mask PPN value to implemented width
-    Uns64 PPNMask = getAddressMask(riscv->extBits) >> RISCV_PAGE_SHIFT;
-    Uns64 PPN     = RD_CSR_FIELD(riscv, vsatp, PPN) & PPNMask;
-    WR_CSR_FIELD(riscv, vsatp, PPN, PPN);
+    // mask PPN value to implemented width, aligning further to 16Kb boundary
+    Uns64 PPNMask = (getAddressMask(riscv->extBits) >> RISCV_PAGE_SHIFT) & -4;
+    Uns64 PPN     = RD_CSR_FIELD(riscv, hgatp, PPN) & PPNMask;
+    WR_CSR_FIELD(riscv, hgatp, PPN, PPN);
 
     // get requested mode
-    Uns32 targetMode = RD_CSR_FIELD(riscv, vsatp, MODE);
+    Uns32 targetMode = RD_CSR_FIELD(riscv, hgatp, MODE);
 
-    if(!((1<<targetMode) & riscv->configInfo.Sv_modes)) {
+    if((1<<targetMode) & riscv->configInfo.Sv_modes) {
 
-        // discard write if invalid mode was specified
-        if(riscv->verbose) {
-            vmiMessage("W", CPU_PREFIX"_ISPV",
-                SRCREF_FMT
-                "%s write with 0x"FMT_Ax" ignored (invalid mode %u)",
-                SRCREF_ARGS(riscv, getPC(riscv)),
-                attrs->name, newValue, targetMode
-            );
-        }
-
-        // revert value
-        WR_CSR(riscv, vsatp, old);
+        // valid mode specified
 
     } else {
 
-        // change in SATP.MODE enables/disables VM
+        // use bare mode if invalid mode was specified (in which case all other
+        // fields read as zero)
+        if(riscv->verbose) {
+            vmiMessage("W", CPU_PREFIX"_ISBM",
+                SRCREF_FMT
+                "%s invalid mode %u specified - use bare mode",
+                SRCREF_ARGS(riscv, getPC(riscv)),
+                attrs->name, targetMode
+            );
+        }
+
+        // select bare mode
+        WR_CSR(riscv, hgatp, 0);
+    }
+
+    if(old!=RD_CSR(riscv, hgatp)) {
+
+        // change in hgatp.MODE enables/disables VM
         riscvSetMode(riscv, getCurrentMode5(riscv));
 
-        // change in SATP.ASID affects effective ASID
+        // change in hgatp.VMID affects effective VMID
         riscvVMSetASID(riscv);
     }
 
-    // return written value
-    return RD_CSR(riscv, vsatp);
+    return RD_CSR(riscv, hgatp);
 }
 
 
@@ -2895,6 +2949,36 @@ static RISCV_CSR_WRITEFN(dcsrW) {
 }
 
 //
+// Implemented using vmiReg only, no mask, high half
+//
+#define CSR_ATTR_TH_( \
+    _ID, _NUM, _ARCH, _ACCESS, _VERSION,            \
+    _ENDB,_NOTR,_TVMT,_WRD,_NOSR,_V, _DESC,         \
+    _PRESENT                                        \
+) [CSR_ID(_ID##h)] = { \
+    name          : #_ID"h",                        \
+    desc          : _DESC,                          \
+    csrNum        : _NUM,                           \
+    arch          : _ARCH|ISA_XLEN_32|ISA_and,      \
+    access        : _ACCESS,                        \
+    version       : RVPV_##_VERSION,                \
+    wEndBlock     : _ENDB,                          \
+    noSaveRestore : _NOSR,                          \
+    noTraceChange : _NOTR,                          \
+    TVMT          : _TVMT,                          \
+    aliasV        : _V,                             \
+    writeRd       : _WRD,                           \
+    presentCB     : _PRESENT,                       \
+    readCB        : 0,                              \
+    readWriteCB   : 0,                              \
+    writeCB       : 0,                              \
+    wstateCB      : 0,                              \
+    reg           : CSR_REGH_MT(_ID),               \
+    writeMaskC32  : -1,                             \
+    writeMaskC64  : -1                              \
+}
+
+//
 // Implemented using vmiReg and optional callbacks, constant write mask
 //
 #define CSR_ATTR_TC_( \
@@ -3115,10 +3199,15 @@ static const riscvCSRAttrs csrs[CSR_ID(LAST)] = {
     CSR_ATTR_TV_     (hedeleg,      0x602, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Exception Delegation",                       0,           0,           0,            0,        0             ),
     CSR_ATTR_T__     (hideleg,      0x603, ISA_H,       0,          1_10,   1,0,0,0,0,0, "Hypervisor Interrupt Delegation",                       0,           0,           0,            0,        hidelegW      ),
     CSR_ATTR_P__     (hie,          0x604, ISA_H,       0,          1_10,   1,0,0,0,1,0, "Hypervisor Interrupt Enable",                           0,           0,           hieR,         0,        hieW          ),
+    CSR_ATTR_T__     (htimedelta,   0x605, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Time Delta",                                 0,           0,           0,            0,        0             ),
     CSR_ATTR_TV_     (hcounteren,   0x606, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Counter Enable",                             0,           0,           0,            0,        0             ),
+    CSR_ATTR_T__     (hgeie,        0x607, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Guest External Interrupt Enable",            0,           0,           0,            0,        hgeieW        ),
+    CSR_ATTR_TH_     (htimedelta,   0x615, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Time Delta High",                            0                                                               ),
+    CSR_ATTR_T__     (htval,        0x643, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Trap Value",                                 0,           0,           0,            0,        0             ),
     CSR_ATTR_P__     (hip,          0x644, ISA_H,       0,          1_10,   1,0,0,0,1,0, "Hypervisor Interrupt Pending",                          0,           0,           hipR,         hipRW,    hipW          ),
     CSR_ATTR_P__     (hvip,         0x645, ISA_H,       0,          1_10,   1,0,0,0,1,0, "Hypervisor Virtual Interrupt Pending",                  0,           0,           hvipR,        0,        hvipW         ),
-    CSR_ATTR_T__     (hgeie,        0x607, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Guest External Interrupt Enable",            0,           0,           0,            0,        hgeieW        ),
+    CSR_ATTR_T__     (htinst,       0x64A, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Trap Instruction",                           0,           0,           0,            0,        0             ),
+    CSR_ATTR_T__     (hgatp,        0x680, ISA_H,       0,          1_10,   0,0,1,0,0,0, "Hypervisor Guest Address Translation and Protection",   0,           0,           0,            0,        hgatpW        ),
     CSR_ATTR_T__     (hgeip,        0xE12, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Hypervisor Guest External Interrupt Pending",           0,           0,           0,            0,        0             ),
 
     //                name          num    arch         access      version    attrs     description                                              present      wState       rCB           rwCB      wCB
@@ -3157,7 +3246,9 @@ static const riscvCSRAttrs csrs[CSR_ID(LAST)] = {
     CSR_ATTR_T__     (mintthresh,   0x347, 0,           0,          1_10,   0,0,0,0,0,0, "Machine Interrupt Level Threshold",                     clicITP,     0,           0,            0,        mintthreshW   ),
     CSR_ATTR_P__     (mscratchcsw,  0x348, ISA_U,       0,          1_10,   0,1,0,1,1,0, "Machine Conditional Scratch Swap, Priv",                clicSWP,     0,           mscratchcswR, 0,        mscratchcswW  ),
     CSR_ATTR_P__     (mscratchcswl, 0x349, 0,           0,          1_10,   0,1,0,1,1,0, "Machine Conditional Scratch Swap, Level",               clicSWP,     0,           mscratchcswlR,0,        mscratchcswlW ),
+    CSR_ATTR_T__     (mtinst,       0x34A, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Machine Trap Instruction",                              0,           0,           0,            0,        0             ),
     CSR_ATTR_T__     (mclicbase,    0x34B, 0,           0,          1_10,   0,0,0,0,0,0, "Machine CLIC Base Address",                             clicMCBP,    0,           0,            0,        mclicbaseW    ),
+    CSR_ATTR_T__     (mtval2,       0x34B, ISA_H,       0,          1_10,   0,0,0,0,0,0, "Machine Second Trap Value",                             0,           0,           0,            0,        0             ),
 
     //                name          num    arch         access      version    attrs     description                                              present      wState       rCB           rwCB      wCB
     CSR_ATTR_P__     (pmpcfg0,      0x3A0, 0,           0,          1_10,   0,0,0,0,0,0, "Physical Memory Protection Configuration 0",            pmpcfgP,     0,           pmpcfgR,      0,        pmpcfgW       ),
@@ -3413,12 +3504,12 @@ static riscvArchitecture getMissingCSRFeatures(
 // for the purposes of a gdb access (if normal is False)
 //
 static Bool checkCSRPresent(
-    riscvCSRAttrsCP   attrs,
-    riscvP            riscv,
-    riscvArchitecture actual,
-    Bool              normal
+    riscvCSRAttrsCP attrs,
+    riscvP          riscv,
+    Bool            normal
 ) {
     riscvArchitecture required = getRequiredCSRFeatures(attrs, riscv);
+    riscvArchitecture actual   = riscv->configInfo.arch;
 
     return (
         (!getMissingCSRFeatures(attrs, riscv, required, actual)) &&
@@ -3559,15 +3650,20 @@ inline static riscvCSRAttrsCP getEntryCSRAttrs(vmiRangeEntryP entry) {
 //
 // Register new CSR
 //
-static void newCSR(riscvCSRAttrsCP attrs, riscvP riscv) {
+static void newCSR(riscvCSRAttrsCP attrs, riscvP riscv, Bool replace) {
 
     Uns32           csrNum = getCSRNum(riscv, attrs);
     vmiRangeTablePP tableP = &riscv->csrTable;
     vmiRangeEntryP  entry  = vmirtGetFirstRangeEntry(tableP, csrNum, csrNum);
 
-    // create new entry for this CSR if required
+    // if entries conflict, either replace with the new entry or select the
+    // last configured entry
     if(!entry) {
         entry = vmirtInsertRangeEntry(tableP, csrNum, csrNum, 0);
+    } else if(replace) {
+        // replace any conflicting entry
+    } else if(!checkCSRPresent(attrs, riscv, True)) {
+        return;
     }
 
     // register attributes and entry
@@ -3606,7 +3702,7 @@ void riscvNewCSR(
     attrs->reg        = getObjectReg(riscv, object, attrs->reg);
     attrs->writeMaskV = getObjectReg(riscv, object, attrs->writeMaskV);
 
-    newCSR(attrs, riscv);
+    newCSR(attrs, riscv, True);
 }
 
 //
@@ -4035,7 +4131,7 @@ void riscvCSRInit(riscvP riscv, Uns32 index) {
     // insert all standard CSRs into CSR lookup table
     for(id=0; id<CSR_ID(LAST); id++) {
         if(csrs[id].name && (RISCV_PRIV_VERSION(riscv) >= csrs[id].version)) {
-            newCSR(&csrs[id], riscv);
+            newCSR(&csrs[id], riscv, False);
         }
     }
 
@@ -4582,11 +4678,10 @@ const char *riscvGetCSRName(riscvP riscv, Uns32 csrNum) {
 //
 Bool riscvReadCSR(riscvCSRAttrsCP attrs, riscvP riscv, void *buffer) {
 
-    riscvArchitecture arch     = riscv->configInfo.arch;
-    Uns32             bits     = riscvGetXlenArch(riscv);
-    Bool              is64Bit  = (bits==64);
-    void             *rawValue = getCSRRegValue(attrs, riscv);
-    Bool              ok       = checkCSRPresent(attrs, riscv, arch, True);
+    Uns32 bits     = riscvGetXlenArch(riscv);
+    Bool  is64Bit  = (bits==64);
+    void *rawValue = getCSRRegValue(attrs, riscv);
+    Bool  ok       = checkCSRPresent(attrs, riscv, True);
 
     if(ok) {
 
@@ -4648,11 +4743,10 @@ Bool riscvReadCSR(riscvCSRAttrsCP attrs, riscvP riscv, void *buffer) {
 //
 Bool riscvWriteCSR(riscvCSRAttrsCP attrs, riscvP riscv, const void *buffer) {
 
-    riscvArchitecture arch     = riscv->configInfo.arch;
-    Uns32             bits     = riscvGetXlenArch(riscv);
-    Bool              is64Bit  = (bits==64);
-    void             *rawValue = getCSRRegValue(attrs, riscv);
-    Bool              ok       = checkCSRPresent(attrs, riscv, arch, True);
+    Uns32 bits     = riscvGetXlenArch(riscv);
+    Bool  is64Bit  = (bits==64);
+    void *rawValue = getCSRRegValue(attrs, riscv);
+    Bool  ok       = checkCSRPresent(attrs, riscv, True);
 
     if(ok) {
 
@@ -5042,7 +5136,7 @@ Bool riscvGetCSRDetails(
 
     while((attrs=getNextCSR(attrs, riscv, csrNumP))) {
 
-        if(checkCSRPresent(attrs, riscv, arch, normal)) {
+        if(checkCSRPresent(attrs, riscv, normal)) {
 
             // fill basic details
             details->attrs  = attrs;

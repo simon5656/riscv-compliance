@@ -497,8 +497,9 @@ static void trapHS(riscvP riscv, trapCxtP cxt) {
     Uns64 epcMask = RD_CSR_MASK(riscv, sepc);
     WR_CSR_FIELD(riscv, sepc, value, cxt->EPC & epcMask);
 
-    // update stval register
+    // update stval and htval registers
     WR_CSR_FIELD(riscv, stval, value, cxt->tval);
+    WR_CSR_FIELD(riscv, htval, value, riscv->GPA);
 
     // get exception base address and mode
     cxt->base = (Addr)RD_CSR_FIELD(riscv, stvec, BASE) << 2;
@@ -512,6 +513,7 @@ static void trapHS(riscvP riscv, trapCxtP cxt) {
     // update previous mode
     WR_CSR_FIELD(riscv, mstatus, SPP, cxt->modeY);
     WR_CSR_FIELD(riscv, hstatus, SPV, VY);
+    WR_CSR_FIELD(riscv, hstatus, GVA, riscv->GVA);
 
     // if access is from a virtual mode, update SPVP with that mode
     if(VY) {
@@ -585,8 +587,9 @@ static void trapM(riscvP riscv, trapCxtP cxt) {
     Uns64 epcMask = RD_CSR_MASK(riscv, mepc);
     WR_CSR_FIELD(riscv, mepc, value, cxt->EPC & epcMask);
 
-    // update mtval register
-    WR_CSR_FIELD(riscv, mtval, value, cxt->tval);
+    // update mtval and mtval2 registers
+    WR_CSR_FIELD(riscv, mtval,  value, cxt->tval);
+    WR_CSR_FIELD(riscv, mtval2, value, riscv->GPA);
 
     // get exception base address and mode
     cxt->base = (Addr)RD_CSR_FIELD(riscv, mtvec, BASE) << 2;
@@ -600,6 +603,7 @@ static void trapM(riscvP riscv, trapCxtP cxt) {
     // update previous mode
     WR_CSR_FIELD(riscv, mstatus, MPP, cxt->modeY);
     WR_CSR_FIELD_ALT(riscv, mstatush, mstatus, MPV, VY);
+    WR_CSR_FIELD_ALT(riscv, mstatush, mstatus, GVA, riscv->GVA);
 }
 
 //
@@ -1385,7 +1389,7 @@ static void enterDM(riscvP riscv, dmCause cause) {
         Uns64 address;
 
         // use either debug entry address or debug exception address
-        if(DM) {
+        if(DM && (cause!=DMC_EBREAK)) {
             address = riscv->configInfo.dexc_address;
         } else {
             address = riscv->configInfo.debug_address;
@@ -1455,11 +1459,15 @@ void riscvSetDMStall(riscvP riscv, Bool DMStall) {
 //
 static VMI_ICOUNT_FN(riscvStepExcept) {
 
-    riscvP riscv = (riscvP)processor;
+    riscvP riscv  = (riscvP)processor;
+    Bool   doStep = False;
 
     if(!inDebugMode(riscv) && RD_CSR_FIELD(riscv, dcsr, step)) {
-        enterDM(riscv, DMC_STEP);
+        vmirtDoSynchronousInterrupt((vmiProcessorP)riscv);
+        doStep = True;
     }
+
+    riscv->netValue.stepreq = doStep;
 }
 
 //
@@ -2142,7 +2150,15 @@ VMI_IFETCH_FN(riscvIFetchExcept) {
         riscv->netValue.irq_ack = False;
     }
 
-    if(riscv->netValue.resethaltreqS) {
+    if(riscv->netValue.stepreq) {
+
+        // enter Debug mode out of reset
+        if(complete) {
+            riscv->netValue.stepreq = False;
+            enterDM(riscv, DMC_STEP);
+        }
+
+    } else if(riscv->netValue.resethaltreqS) {
 
         // enter Debug mode out of reset
         if(complete) {

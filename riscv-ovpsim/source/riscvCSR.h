@@ -168,16 +168,16 @@ typedef enum riscvCSRIdE {
     CSR_ID      (hedeleg),      // 0x602
     CSR_ID      (hideleg),      // 0x603
     CSR_ID      (hie),          // 0x604
+    CSR_ID      (htimedelta),   // 0x605
     CSR_ID      (hcounteren),   // 0x606
     CSR_ID      (hgeie),        // 0x607
+    CSR_ID      (htimedeltah),  // 0x615
     CSR_ID      (htval),        // 0x643
     CSR_ID      (hip),          // 0x644
     CSR_ID      (hvip),         // 0x645
     CSR_ID      (htinst),       // 0x64A
     CSR_ID      (hgeip),        // 0xE12
     CSR_ID      (hgatp),        // 0x680
-    CSR_ID      (htimedelta),   // 0x605
-    CSR_ID      (htimedeltah),  // 0x615
 
     CSR_ID      (vsstatus),     // 0x200
     CSR_ID      (vsie),         // 0x204
@@ -213,7 +213,9 @@ typedef enum riscvCSRIdE {
     CSR_ID      (mintthresh),   // 0x347
     CSR_ID      (mscratchcsw),  // 0x348
     CSR_ID      (mscratchcswl), // 0x349
+    CSR_ID      (mtinst),       // 0x34A
     CSR_ID      (mclicbase),    // 0x34B
+    CSR_ID      (mtval2),       // 0x34B
     CSR_ID_0_15 (pmpcfg),       // 0x3A0-0x3AF
     CSR_ID_0_63 (pmpaddr),      // 0x3B0-0x3EF
     CSR_ID      (mcycle),       // 0xB00
@@ -646,6 +648,7 @@ CSR_REG_STRUCT_DECL_32_64(status);
 typedef CSR_REG_TYPE(status) CSR_REG_TYPE(ustatus);
 typedef CSR_REG_TYPE(status) CSR_REG_TYPE(sstatus);
 typedef CSR_REG_TYPE(status) CSR_REG_TYPE(mstatus);
+typedef CSR_REG_TYPE(status) CSR_REG_TYPE(vsstatus);
 
 // define alias masks (include sstatus.VS field in both 0.8 and 0.9 positions)
 #define sstatus_AMASK 0x80000003818de773ULL
@@ -1052,12 +1055,25 @@ typedef CSR_REG_TYPE(cause) CSR_REG_TYPE(mcause);
 // stval        (id 0x143)
 // vstval       (id 0x243)
 // mtval        (id 0x343)
+// mtval2       (id 0x34B)
+// htval        (id 0x643)
 // -----------------------------------------------------------------------------
 
 // define alias types
 typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(utval);
 typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(stval);
 typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(mtval);
+typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(mtval2);
+typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(htval);
+
+// -----------------------------------------------------------------------------
+// mtinst       (id 0x34A)
+// htinst       (id 0x64A)
+// -----------------------------------------------------------------------------
+
+// define alias types
+typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(mtinst);
+typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(htinst);
 
 // -----------------------------------------------------------------------------
 // uip          (id 0x044)
@@ -1083,7 +1099,7 @@ typedef struct {
     Uns32 VSEIP :  1;
     Uns32 MEIP  :  1;
     Uns32 SGEIP :  1;
-    Uns32 _u3   :  3;
+    Uns32 _u1   :  3;
     Uns64 LI    : 48;
 } CSR_REG_TYPE_64(ip);
 
@@ -1237,6 +1253,29 @@ CSR_REG_STRUCT_DECL_32_64(atp);
 typedef CSR_REG_TYPE(atp) CSR_REG_TYPE(satp);
 
 // -----------------------------------------------------------------------------
+// hgatp        (id 0x680)
+// -----------------------------------------------------------------------------
+
+// 32-bit view
+typedef struct {
+    Uns32 PPN  : 22;
+    Uns32 VMID :  7;
+    Uns32 _u1  :  2;
+    Uns32 MODE :  1;
+} CSR_REG_TYPE_32(hgatp);
+
+// 64-bit view
+typedef struct {
+    Uns64 PPN  : 44;
+    Uns64 VMID : 14;
+    Uns64 _u1  :  2;
+    Uns64 MODE :  4;
+} CSR_REG_TYPE_64(hgatp);
+
+// define 32/64 bit type
+CSR_REG_STRUCT_DECL_32_64(hgatp);
+
+// -----------------------------------------------------------------------------
 // mcycle       (id 0xB00)
 // cycle        (id 0xC00)
 // -----------------------------------------------------------------------------
@@ -1303,6 +1342,14 @@ typedef CSR_REG_TYPE(generic32) CSR_REG_TYPE(instreth);
 // define alias types
 typedef CSR_REG_TYPE(generic32) CSR_REG_TYPE(mhpmcounterh);
 typedef CSR_REG_TYPE(generic32) CSR_REG_TYPE(hpmcounterh);
+
+// -----------------------------------------------------------------------------
+// htimedelta   (id 0x605)
+// htimedeltah  (id 0x615)
+// -----------------------------------------------------------------------------
+
+// define alias types
+typedef CSR_REG_TYPE(generic32) CSR_REG_TYPE(htimedelta);
 
 // -----------------------------------------------------------------------------
 // mvendorid    (id 0xF11)
@@ -1570,12 +1617,6 @@ typedef CSR_REG_TYPE(genericXLEN) CSR_REG_TYPE(vlenb);
 #define CSR_REG_DECL_V(_N) CSR_REG_TYPE(_N) _N, v##_N
 
 //
-// Use this to define a register entry in riscvCSRs below with virtual alias
-// only
-//
-#define CSR_REG_DECL_v(_N) CSR_REG_TYPE(_N) v##_N
-
-//
 // This type defines the CSRs implemented as true registers in the processor
 // structure
 //
@@ -1615,12 +1656,16 @@ typedef struct riscvCSRsS {
     CSR_REG_DECL  (hstatus);        // 0x600
     CSR_REG_DECL  (hedeleg);        // 0x602
     CSR_REG_DECL  (hideleg);        // 0x603
+    CSR_REG_DECL  (htimedelta);     // 0x605
     CSR_REG_DECL  (hcounteren);     // 0x606
     CSR_REG_DECL  (hgeie);          // 0x607
+    CSR_REG_DECL  (htval);          // 0x643
+    CSR_REG_DECL  (htinst);         // 0x64A
+    CSR_REG_DECL  (hgatp);          // 0x680
     CSR_REG_DECL  (hgeip);          // 0xE12
 
     // VIRTUAL MODE CSRS
-    CSR_REG_DECL_v(sstatus);        // 0x600
+    CSR_REG_DECL  (vsstatus);       // 0x600
 
     // MACHINE MODE CSRS
     CSR_REG_DECL  (mvendorid);      // 0xF11
@@ -1643,8 +1688,10 @@ typedef struct riscvCSRsS {
     CSR_REG_DECL  (mtval);          // 0x343
     CSR_REG_DECL  (mip);            // 0x344
     CSR_REG_DECL  (mintstatus);     // 0x346
-    CSR_REG_DECL  (mintthresh);     // 0x34A
+    CSR_REG_DECL  (mintthresh);     // 0x347
+    CSR_REG_DECL  (mtinst);         // 0x34A
     CSR_REG_DECL  (mclicbase);      // 0x34B
+    CSR_REG_DECL  (mtval2);         // 0x34B
 
     // DEBUG MODE CSRS
     CSR_REG_DECL  (dcsr);           // 0x7B0
@@ -1714,34 +1761,55 @@ typedef struct riscvCSRMasksS {
 // SYSTEM REGISTER ACCESS MACROS
 ////////////////////////////////////////////////////////////////////////////////
 
+// get raw value using XLEN=32 view
+#define RD_RAW32(_R) ((_R).u32.bits)
+
+// get raw value using XLEN=64 view
+#define RD_RAW64(_R) ((_R).u64.bits)
+
+// get raw value using current XLEN
+#define RD_RAW(_CPU, _R) (RISCV_XLEN_IS_32(_CPU) ? RD_RAW32(_R) : RD_RAW64(_R))
+
+// get CSR value using XLEN=32 view
+#define RD_CSR32(_CPU, _RNAME) RD_RAW32((_CPU)->csr._RNAME)
+
+// get CSR value using XLEN=64 view
+#define RD_CSR64(_CPU, _RNAME) RD_RAW64((_CPU)->csr._RNAME)
+
 // get CSR value using current XLEN
-#define RD_CSR(_CPU, _RNAME) ( \
-    (RISCV_XLEN_IS_32(_CPU) ?                               \
-        (_CPU)->csr._RNAME.u32.bits :                       \
-        (_CPU)->csr._RNAME.u64.bits)                        \
-)
+#define RD_CSR(_CPU, _RNAME) RD_RAW(_CPU, (_CPU)->csr._RNAME)
+
+// get raw value using XLEN=32 view
+#define WR_RAW32(_R, _VALUE) (_R).u32.bits = _VALUE
+
+// get raw value using XLEN=64 view
+#define WR_RAW64(_R, _VALUE) (_R).u64.bits = _VALUE
+
+// set raw value using current XLEN
+#define WR_RAW(_CPU, _R, _VALUE) \
+    if(RISCV_XLEN_IS_32(_CPU)) {                            \
+        WR_RAW32(_R, _VALUE);                               \
+    } else {                                                \
+        WR_RAW64(_R, _VALUE);                               \
+    }
 
 // set CSR value using current XLEN
 #define WR_CSR(_CPU, _RNAME, _VALUE) \
-    if(RISCV_XLEN_IS_32(_CPU)) {                            \
-        (_CPU)->csr._RNAME.u32.bits = _VALUE;               \
-    } else {                                                \
-        (_CPU)->csr._RNAME.u64.bits = _VALUE;               \
-    }
+    WR_RAW(_CPU, (_CPU)->csr._RNAME, _VALUE)
 
 // get raw field using current XLEN
 #define RD_RAW_FIELD(_CPU, _R, _FIELD) ( \
     (RISCV_XLEN_IS_32(_CPU) ?                               \
-        _R.u32.fields._FIELD :                              \
-        _R.u64.fields._FIELD)                               \
+        (_R).u32.fields._FIELD :                            \
+        (_R).u64.fields._FIELD)                             \
 )
 
 // set raw field using current XLEN
 #define WR_RAW_FIELD(_CPU, _R, _FIELD, _VALUE) \
     if(RISCV_XLEN_IS_32(_CPU)) {                            \
-        _R.u32.fields._FIELD = _VALUE;                      \
+        (_R).u32.fields._FIELD = _VALUE;                    \
     } else {                                                \
-        _R.u64.fields._FIELD = _VALUE;                      \
+        (_R).u64.fields._FIELD = _VALUE;                    \
     }
 
 // get CSR field using current XLEN
@@ -1758,11 +1826,11 @@ typedef struct riscvCSRMasksS {
 
 // set raw field in XLEN=32 view
 #define WR_RAW_FIELD32(_R, _FIELD, _VALUE) \
-    _R.u32.fields._FIELD = _VALUE
+    (_R).u32.fields._FIELD = _VALUE
 
 // set raw field in XLEN=64 view
 #define WR_RAW_FIELD64(_R, _FIELD, _VALUE) \
-    _R.u64.fields._FIELD = _VALUE
+    (_R).u64.fields._FIELD = _VALUE
 
 // set CSR field in XLEN=32 view
 #define WR_CSR_FIELD32(_CPU, _RNAME, _FIELD, _VALUE) \
@@ -1775,16 +1843,16 @@ typedef struct riscvCSRMasksS {
 // get raw field using current XLEN from 32/64 bit alternate registers
 #define RD_RAW_FIELD_ALT(_CPU, _R32, _R64, _FIELD) ( \
     (RISCV_XLEN_IS_32(_CPU) ?                               \
-        _R32.u32.fields._FIELD :                            \
-        _R64.u64.fields._FIELD)                             \
+        (_R32).u32.fields._FIELD :                          \
+        (_R64).u64.fields._FIELD)                           \
 )
 
 // set raw field using current XLEN from 32/64 bit alternate registers
 #define WR_RAW_FIELD_ALT(_CPU, _R32, _R64, _FIELD, _VALUE) \
     if(RISCV_XLEN_IS_32(_CPU)) {                            \
-        _R32.u32.fields._FIELD = _VALUE;                    \
+        (_R32).u32.fields._FIELD = _VALUE;                  \
     } else {                                                \
-        _R64.u64.fields._FIELD = _VALUE;                    \
+        (_R64).u64.fields._FIELD = _VALUE;                  \
     }
 
 // get CSR field using current XLEN from 32/64 bit alternate registers
@@ -1865,6 +1933,11 @@ typedef struct riscvCSRMasksS {
 // Morph-time macros to access a CSR register by id
 //
 #define CSR_REG_MT(_ID)     RISCV_CPU_REG(csr._ID)
+
+//
+// Morph-time macros to access a CSR register high half by id
+//
+#define CSR_REGH_MT(_ID)    RISCV_CPU_REGH(csr._ID)
 
 //
 // Morph-time macros to access a CSR register mask by id

@@ -81,7 +81,7 @@ typedef enum riscvArchitectureE {
     ISA_SandN  = (ISA_S|ISA_N|ISA_and),     // both supervisor and user interrupts
     ISA_FSandV = (ISA_FS|ISA_V|ISA_and),    // both FS and vector extension
     ISA_VU     = (ISA_U|ISA_H),             // virtual user mode
-    ISA_VS     = (ISA_S|ISA_H),             // virtual user mode
+    ISA_VS     = (ISA_S|ISA_H),             // virtual supervisor mode
 
     RV32     = ISA_XLEN_32,
     RV32I    = ISA_XLEN_32  | ISA_I,

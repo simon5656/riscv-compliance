@@ -247,6 +247,7 @@ static void applyParamsSMP(riscvP riscv, riscvParamValuesP params) {
     cfg->reset_address       = params->reset_address;
     cfg->nmi_address         = params->nmi_address;
     cfg->ASID_bits           = params->ASID_bits;
+    cfg->VMID_bits           = params->VMID_bits;
     cfg->PMP_grain           = params->PMP_grain;
     cfg->PMP_registers       = params->PMP_registers;
     cfg->Sv_modes            = params->Sv_modes | RISCV_VMM_BARE;

@@ -579,6 +579,15 @@ static RISCV_PDEFAULT_FN(default_ASID_bits) {
 }
 
 //
+// Set default and maximum value of VMID_bits
+//
+static RISCV_PDEFAULT_FN(default_VMID_bits) {
+
+    setUns32ParamDefault(param, cfg->VMID_bits);
+    setUns32ParamMax(param, (cfg->arch&ISA_XLEN_64) ? 14 : 7);
+}
+
+//
 // Set default and maximum value of CLICCFGMBITS
 //
 static RISCV_PDEFAULT_FN(default_CLICINTCTLBITS) {
@@ -751,6 +760,7 @@ static riscvParameter parameters[] = {
     {  RVPV_ALL,     default_xret_preserves_lr,    VMI_BOOL_PARAM_SPEC  (riscvParamValues, xret_preserves_lr,    False,                     "Whether an xRET instruction preserves the value of LR")},
     {  RVPV_V,       default_require_vstart0,      VMI_BOOL_PARAM_SPEC  (riscvParamValues, require_vstart0,      False,                     "Whether CSR vstart must be 0 for non-interruptible vector instructions")},
     {  RVPV_S,       default_ASID_bits,            VMI_UNS32_PARAM_SPEC (riscvParamValues, ASID_bits,            0, 0,          0,          "Specify the number of implemented ASID bits")},
+    {  RVPV_H,       default_VMID_bits,            VMI_UNS32_PARAM_SPEC (riscvParamValues, VMID_bits,            0, 0,          0,          "Specify the number of implemented VMID bits")},
     {  RVPV_A,       default_lr_sc_grain,          VMI_UNS32_PARAM_SPEC (riscvParamValues, lr_sc_grain,          1, 1,          (1<<16),    "Specify byte granularity of ll/sc lock region (constrained to a power of two)")},
     {  RVPV_ALL,     default_reset_address,        VMI_UNS64_PARAM_SPEC (riscvParamValues, reset_address,        0, 0,          -1,         "Override reset vector address")},
     {  RVPV_ALL,     default_nmi_address,          VMI_UNS64_PARAM_SPEC (riscvParamValues, nmi_address,          0, 0,          -1,         "Override NMI vector address")},

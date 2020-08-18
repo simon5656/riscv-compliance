@@ -39,6 +39,7 @@
 // morph-time macros to calculate offsets to registers in a RISCV structure
 #define RISCV_CPU_OFFSET(_R)    VMI_CPU_OFFSET(riscvP, _R)
 #define RISCV_CPU_REG(_R)       VMI_CPU_REG(riscvP, _R)
+#define RISCV_CPU_REGH(_R)      VMI_CPU_REG_DELTA(riscvP, _R, 4)
 #define RISCV_CPU_TEMP(_R)      VMI_CPU_TEMP(riscvP, _R)
 #define RISCV_CPU_VBASE(_I)     VMI_CPU_TEMP(riscvP, vBase[_I])
 #define RISCV_GPR(_I)           RISCV_CPU_REG(x[_I])

@@ -91,7 +91,6 @@ typedef struct riscvConfigS {
     Uns32             noinhibit_mask;	// counter no-inhibit mask
     Uns32             local_int_num;    // number of local interrupts
     Uns32             lr_sc_grain;      // LR/SC region grain size
-    Uns32             ASID_bits;        // number of implemented ASID bits
     Uns32             PMP_grain;        // PMP region grain size
     Uns32             PMP_registers;    // number of implemented PMP registers
     Uns32             Sv_modes;         // bit mask of valid Sv modes
@@ -101,6 +100,8 @@ typedef struct riscvConfigS {
     Uns32             SLEN;             // SLEN (vector extension)
     Uns32             VLEN;             // VLEN (vector extension)
     Uns32             SEW_min;          // minimum SEW (vector extension)
+    Uns8              ASID_bits;        // number of implemented ASID bits
+    Uns8              VMID_bits;        // number of implemented VMID bits
     Bool              Zvlsseg;          // Zvlsseg implemented?
     Bool              Zvamo;            // Zvamo implemented?
     Bool              Zvediv;           // Zvediv implemented?

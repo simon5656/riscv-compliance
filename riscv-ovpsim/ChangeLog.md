@@ -11,6 +11,11 @@ NOTE: X-commit messages below refer to git commits in the following
   I-commit: https://github.com/riscv/riscv-isa-manual
   V-commit: https://github.com/riscv/riscv-v-spec
 
+- Hypervisor mode support is under development: do not enable this extension
+  until the development work is complete.
+- Debug mode step breakpoint is now implemented as an interrupt before the
+  start of the next instruction.
+
 Date 2020-July-23
 Release 20200722.0
 ===

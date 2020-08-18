@@ -68,12 +68,12 @@
 typedef struct riscvNetValueS {
     Bool reset;         // level of reset signal
     Bool haltreq;       // haltreq (Debug mode)
+    Bool stepreq;       // stepreq (Debug mode)
     Bool resethaltreq;  // resethaltreq (Debug mode)
     Bool resethaltreqS; // resethaltreq (Debug mode, sampled at reset)
     Bool deferint;      // defer taking interrupts (artifact)
     Bool enableCLIC;    // is CLIC enabled?
     Bool irq_ack;       // IRQ acknowledge (output)
-    Bool _u2;           // (for alignment)
 } riscvNetValue;
 
 //
@@ -273,10 +273,16 @@ typedef struct riscvS {
     memDomainP         CLICDomain;      // CLIC domain
     riscvPMPCFG        pmpcfg;          // pmpcfg registers
     Uns64             *pmpaddr;         // pmpaddr registers
-    riscvTLBP          tlb;             // TLB cache
-    Uns8               extBits    :  8; // bit size of external domains
-    Bool               PTWActive  :  1; // page table walk active
-    Bool               PTWBadAddr :  1; // page table walk address was bad
+    riscvTLBP          tlb[RISCV_TLB_LAST];// TLB caches
+    Uns8               extBits    : 8;  // bit size of external domains
+    Uns8               s2Offset   : 2;  // stage 2 additional page offset
+    riscvTLBId         activeTLB  : 2;  // currently-active TLB context
+    Bool               PTWActive  : 1;  // page table walk active
+    Bool               PTWBadAddr : 1;  // page table walk address was bad
+    Bool               s2Active   : 1;  // stage 2 access active
+    Bool               GVA        : 1;  // is guest virtual address?
+    Uns64              GPA;             // faulting guest physical address
+    Uns64              s1VA;            // stage 1 VA in stage 2 context
 
     // Messages
     riscvBasicIntState intState;        // basic interrupt state
@@ -351,6 +357,13 @@ inline static Bool inDebugMode(riscvP riscv) {
 //
 inline static Uns32 getASIDMask(riscvP riscv) {
     return (1<<riscv->configInfo.ASID_bits)-1;
+}
+
+//
+// Return mask of implemented VMID bits
+//
+inline static Uns32 getVMIDMask(riscvP riscv) {
+    return (1<<riscv->configInfo.VMID_bits)-1;
 }
 
 //

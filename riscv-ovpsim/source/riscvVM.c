@@ -51,21 +51,27 @@
 DEFINE_S(tlbEntry);
 
 //
-// Union representing simulated ASID (including bits depending on MSTATUS
-// register settings)
+// Union representing simulated ASID (including bits depending on xstatus
+// register settings and VMID if required)
 //
 typedef union riscvSimASIDU {
 
     // field view
     struct {
-        Uns16 ASID : 16; // ASID
-        Bool  MXR  :  1; // MSTATUS make-executable-readable
-        Bool  SUM  :  1; // MSTATUS supervisor-user-access
-        Uns32 _u1  : 14; // padding bits
+        Uns16 ASID_HS : 16; // HS-mode ASID
+        Uns16 ASID_VS : 16; // VS-mode ASID
+        Uns16 VMID    : 16; // VMID
+        Bool  MXR_HS  :  1; // HS-mode make-executable-readable
+        Bool  SUM_HS  :  1; // HS-mode supervisor-user-access
+        Bool  MXR_VS  :  1; // VS-mode make-executable-readable
+        Bool  SUM_VS  :  1; // VS-mode supervisor-user-access
+        Bool  S1      :  1; // is virtual stage 1 enabled?
+        Bool  S2      :  1; // is virtual stage 2 enabled?
+        Uns32 _u1     : 10; // padding bits
     } f;
 
     // full simulated ASID view
-    Uns32 u32;
+    Uns64 u64;
 
 } riscvSimASID;
 
@@ -81,19 +87,19 @@ typedef struct tlbEntryS {
     // entry low physical address
     Uns64 PA;
 
-    // simulated ASID when mapped (including MSTATUS bits that affect it)
+    // simulated ASID when mapped (including xstatus bits that affect it)
     riscvSimASID simASID;
 
     // entry attributes
-    Uns8  isMapped :  4;    // TLB entry mapped (per base mode)
-    Uns32 priv     :  3;    // access privilege
-    Uns32 U        :  1;    // user accessible?
-    Uns32 G        :  1;    // global bit
-    Uns32 A        :  1;    // accessed bit (read or written)
-    Uns32 D        :  1;    // dirty bit (written)
-    Bool  artifact :  1;    // entry created by artifact lookup (do not match)
-    Bool  V        :  1;    // is TLB entry virtual?
-    Uns32 _u1      : 19;    // spare bits
+    riscvTLBId tlb      :  2;   // containing TLB
+    Uns8       mapped   :  2;   // TLB entry mapped (per base mode)
+    Uns32      priv     :  3;   // access privilege
+    Uns32      U        :  1;   // user accessible?
+    Uns32      G        :  1;   // global bit
+    Uns32      A        :  1;   // accessed bit (read or written)
+    Uns32      D        :  1;   // dirty bit (written)
+    Bool       artifact :  1;   // entry created by artifact lookup
+    Uns32      _u1      : 20;   // spare bits
 
     // range LUT entry (for fast lookup by address)
     union {
@@ -154,9 +160,83 @@ typedef enum VAModeE {
 }
 
 //
+// Return the effective stage 1 TLB
+//
+inline static riscvTLBId getS1TLBId(riscvP riscv) {
+    return inVMode(riscv) ? RISCV_TLB_VS1 : RISCV_TLB_HS;
+}
+
+//
+// Determine the currently-active TLB
+//
+static riscvTLBId getCurrentTLBId(riscvP riscv) {
+
+    riscvTLBId result = RISCV_TLB_LAST;
+
+    if(!inVMode(riscv)) {
+
+        if(RD_CSR_FIELD(riscv, satp, MODE)) {
+            result = RISCV_TLB_HS;
+        }
+
+    } else {
+
+        if(RD_CSR_FIELD(riscv, vsatp, MODE)) {
+            result = RISCV_TLB_VS1;
+        } else if(RD_CSR_FIELD(riscv, hgatp, MODE)) {
+            result = RISCV_TLB_VS2;
+        }
+    }
+
+    VMI_ASSERT(result!=RISCV_TLB_LAST, "no active TLB");
+
+    return result;
+}
+
+//
+// Return the currently-activated TLB
+//
+static riscvTLBP getActiveTLB(riscvP riscv) {
+    return riscv->tlb[riscv->activeTLB];
+}
+
+//
+// Activate the given TLB (and return the previous active TLB)
+//
+inline static riscvTLBId activateTLB(riscvP riscv, riscvTLBId id) {
+
+    riscvTLBId old = riscv->activeTLB;
+
+    riscv->activeTLB = id;
+
+    return old;
+}
+
+//
+// Deactivate the given TLB, restoring previous active state
+//
+inline static void deactivateTLB(riscvP riscv, riscvTLBId old) {
+    riscv->activeTLB = old;
+}
+
+//
+// Is a virtual TLB active?
+//
+inline static Bool activeTLBIsVirtual(riscvP riscv) {
+    return (riscv->activeTLB!=RISCV_TLB_HS);
+}
+
+//
+// Is the VS stage 2 TLB active?
+//
+inline static Bool activeTLBIsVS2(riscvP riscv) {
+    return (riscv->activeTLB==RISCV_TLB_VS2);
+}
+
+//
 // Return current program counter
 //
-static Uns64 getPC(riscvP riscv) {
+inline static Uns64 getPC(riscvP riscv) {
     return vmirtGetPC((vmiProcessorP)riscv);
 }
 
@@ -171,7 +251,7 @@ inline static Uns32 getNumPMPs(riscvP riscv) {
 // Return table entry implied global state
 //
 inline static Bool getG(riscvP riscv, Bool G) {
-    return G || !getASIDMask(riscv);
+    return G || activeTLBIsVS2(riscv) || !getASIDMask(riscv);
 }
 
 //
@@ -189,19 +269,46 @@ inline static Bool updatePTED(riscvP riscv) {
 }
 
 //
-// Return TLB entry ASID
+// Does the TLB entry have a VMID?
 //
-inline static Uns32 getEntryASID(tlbEntryP entry) {
-    return entry->simASID.f.ASID;
+inline static Bool entryHasVMID(tlbEntryP entry) {
+    return (entry->tlb==RISCV_TLB_VS1) || (entry->tlb==RISCV_TLB_VS2);
 }
 
 //
-// Given a TLB entry, return the corresponding simulated ASID including MSTATUS
-// bits that affect whether entries are used that wee in force when the entry
+// Return TLB entry ASID
+//
+static Uns32 getEntryASID(tlbEntryP entry) {
+    switch(entry->tlb) {
+        case RISCV_TLB_HS:
+            return entry->simASID.f.ASID_HS;
+        case RISCV_TLB_VS1:
+            return entry->simASID.f.ASID_VS;
+        default:
+            return 0;
+    }
+}
+
+//
+// Return TLB entry VMID
+//
+static Uns32 getEntryVMID(tlbEntryP entry) {
+    switch(entry->tlb) {
+        case RISCV_TLB_VS1:
+        case RISCV_TLB_VS2:
+            return entry->simASID.f.VMID;
+        default:
+            return 0;
+    }
+}
+
+//
+// Given a TLB entry, return the corresponding simulated ASID including xstatus
+// bits that affect whether entries are used that were in force when the entry
 // was created
 //
-inline static Uns32 getEntrySimASID(tlbEntryP entry) {
-    return entry->simASID.u32;
+inline static Uns64 getEntrySimASID(tlbEntryP entry) {
+    return entry->simASID.u64;
 }
 
 //
@@ -219,6 +326,13 @@ inline static Uns64 getEntryHighVA(tlbEntryP entry) {
 }
 
 //
+// Return TLB entry size
+//
+inline static Uns64 getEntrySize(tlbEntryP entry) {
+    return entry->highVA - entry->lowVA + 1;
+}
+
+//
 // Return TLB entry low PA
 //
 inline static Uns64 getEntryLowPA(tlbEntryP entry) {
@@ -233,42 +347,51 @@ inline static Uns64 getEntryHighPA(tlbEntryP entry) {
 }
 
 //
+// Return TLB entry VA-to-PA offset
+//
+inline static Uns64 getEntryVAtoPA(tlbEntryP entry) {
+    return entry->PA - entry->lowVA;
+}
+
+//
 // Return TLB entry ASID mask
 //
-inline static Uns32 getEntryASIDMask(tlbEntryP entry, riscvMode mode) {
+inline static Uns64 getEntryASIDMask(tlbEntryP entry, riscvMode mode) {
 
-    riscvSimASID ASIDMask = {f:{MXR:1}};
+    Bool         V        = modeIsVirtual(mode);
+    riscvSimASID ASIDMask = {f:{MXR_HS:1}};
 
     // include ASID field only if this entry is not global
-    if(!entry->G) {
-        ASIDMask.f.ASID = -1;
+    if(entry->G) {
+        // no action
+    } else if(V) {
+        ASIDMask.f.ASID_VS = -1;
+    } else {
+        ASIDMask.f.ASID_HS = -1;
     }
 
     // include U field only if this entry is user-accessible and in Supervisor
     // mode
-    if(entry->U && (mode==RISCV_MODE_S)) {
-        ASIDMask.f.SUM = 1;
+    if(entry->tlb==RISCV_TLB_VS2) {
+        // stage 2 entries are always treated as user mode, so SUM is ignored
+    } else if(entry->U && (getBaseMode(mode)==RISCV_MODE_S)) {
+        ASIDMask.f.SUM_HS = !V;
+        ASIDMask.f.SUM_VS =  V;
     }
 
-    return ASIDMask.u32;
+    // include fields required only when V=1
+    if(V) {
+        ASIDMask.f.VMID   = -1;
+        ASIDMask.f.MXR_VS = -1;
+        ASIDMask.f.S1     = -1;
+        ASIDMask.f.S2     = -1;
+    }
+
+    return ASIDMask.u64;
 }
 
 //
-// Get effective value of MSTATUS.MXR
-//
-inline static Bool getMXR(riscvP riscv) {
-    return RD_CSR_FIELD(riscv, mstatus, MXR);
-}
-
-//
-// Get effective value of MSTATUS.SUM
-//
-inline static Bool getSUM(riscvP riscv) {
-    return RD_CSR_FIELD(riscv, mstatus, SUM);
-}
-
-//
-// Get effective value of MSTATUS.MPRV
+// Get effective value of xstatus.MPRV
 //
 static Bool getMPRV(riscvP riscv) {
 
@@ -283,27 +406,51 @@ static Bool getMPRV(riscvP riscv) {
 }
 
 //
-// Get effective value of MSTATUS.MPP
+// Get effective value of xstatus.MPP
 //
 inline static riscvMode getMPP(riscvP riscv) {
     return RD_CSR_FIELD(riscv, mstatus, MPP);
 }
 
 //
-// Get effective value of SATP.ASID
+// Get ASID for the currently-active TLB
 //
-static Uns32 getActiveASID(riscvP riscv, riscvMode mode) {
-
-    Bool V = modeIsVirtual(mode);
-
-    return RD_CSR_FIELD_V(riscv, satp, V, ASID);
+static Uns32 getActiveASID(riscvP riscv) {
+    switch(riscv->activeTLB) {
+        case RISCV_TLB_HS:
+            return RD_CSR_FIELD(riscv, satp, ASID);
+        case RISCV_TLB_VS1:
+            return RD_CSR_FIELD(riscv, vsatp, ASID);
+        default:
+            return 0;
+    }
 }
 
 //
-// Is code demain required for the passed privilege?
+// Get VMID for the currently-active TLB
+//
+static Uns32 getActiveVMID(riscvP riscv) {
+    switch(riscv->activeTLB) {
+        case RISCV_TLB_VS1:
+        case RISCV_TLB_VS2:
+            return RD_CSR_FIELD(riscv, hgatp, VMID);
+        default:
+            return 0;
+    }
+}
+
+//
+// Is code domain required for the passed privilege?
 //
 inline static Bool isFetch(memPriv priv) {
     return (priv & MEM_PRIV_X) && True;
+}
+
+//
+// Does the entry ASID match the given TLB VMID?
+//
+inline static Bool matchVMID(Uns32 VMID, tlbEntryP entry) {
+    return !entryHasVMID(entry) || (VMID==getEntryVMID(entry));
 }
 
 //
@@ -311,22 +458,26 @@ inline static Bool isFetch(memPriv priv) {
 // entries)
 //
 inline static Bool matchASID(Uns32 ASID, tlbEntryP entry) {
-    return entry->G || (ASID==getEntryASID(entry));
+    return (entry->G || (ASID==getEntryASID(entry)));
 }
 
 //
-// Return the current simulated ASID, taking into account MSTATUS bits that
+// Return the current simulated ASID, taking into account xstatus bits that
 // affect whether entries are used
 //
 static riscvSimASID getSimASID(riscvP riscv) {
 
-    riscvMode mode = getCurrentMode5(riscv);
-
     return (riscvSimASID){
         f: {
-            ASID : getActiveASID(riscv, mode),
-            MXR  : getMXR(riscv),
-            SUM  : getSUM(riscv)
+            ASID_HS : RD_CSR_FIELD(riscv, satp, ASID),
+            ASID_VS : RD_CSR_FIELD(riscv, vsatp, ASID),
+            VMID    : RD_CSR_FIELD(riscv, hgatp, VMID),
+            MXR_HS  : RD_CSR_FIELD(riscv, mstatus, MXR),
+            SUM_HS  : RD_CSR_FIELD(riscv, mstatus, SUM),
+            MXR_VS  : RD_CSR_FIELD(riscv, vsstatus, MXR),
+            SUM_VS  : RD_CSR_FIELD(riscv, vsstatus, SUM),
+            S1      : RD_CSR_FIELD(riscv, vsatp, MODE),
+            S2      : RD_CSR_FIELD(riscv, hgatp, MODE)
         }
     };
 }
@@ -341,11 +492,31 @@ inline static Uns64 getPTETableAddress(Uns64 PPN) {
 //
 // Get root page table address
 //
-static Uns64 getRootTableAddress(riscvP riscv, riscvMode mode) {
+static Uns64 getRootTableAddress(riscvP riscv) {
 
-    Bool V = modeIsVirtual(mode);
+    Uns64 result = 0;
 
-    return getPTETableAddress(RD_CSR_FIELD_V(riscv, satp, V, PPN));
+    switch(riscv->activeTLB) {
+
+        case RISCV_TLB_HS:
+            result = getPTETableAddress(RD_CSR_FIELD(riscv, satp, PPN));
+            break;
+
+        case RISCV_TLB_VS1:
+            result = getPTETableAddress(RD_CSR_FIELD(riscv, vsatp, PPN));
+            break;
+
+        case RISCV_TLB_VS2:
+            result = getPTETableAddress(RD_CSR_FIELD(riscv, hgatp, PPN));
+            result += (riscv->s2Offset * 4096);
+            break;
+
+        default:
+            VMI_ABORT("Invalid TLB %u", riscv->activeTLB); // LCOV_EXCL_LINE
+            break;
+    }
+
+    return result;
 }
 
 //
@@ -358,15 +529,29 @@ static memPriv checkEntryPermission(
     memPriv   requiredPriv
 ) {
     memPriv priv = entry->priv;
+    Bool    MXR  = RD_CSR_FIELD(riscv, mstatus, MXR);
+    Bool    SUM  = RD_CSR_FIELD(riscv, mstatus, SUM);
 
-    // add read permission if executable and MSTATUS.MXR=1 (must be done
+    if(riscv->activeTLB==RISCV_TLB_VS1) {
+
+        // modify MXR and SUM if this is a stage 1 virtual access
+        MXR |= RD_CSR_FIELD(riscv, vsstatus, MXR);
+        SUM  = RD_CSR_FIELD(riscv, vsstatus, SUM);
+
+    } else if(riscv->activeTLB==RISCV_TLB_VS2) {
+
+        // stage 2 accesses are always taken to be U mode
+        mode = RISCV_MODE_U;
+    }
+
+    // add read permission if executable and xstatus.MXR=1 (must be done
     // *before* mode-specific check below to correctly handle version-specific
     // SUM behavior)
-    if((priv&MEM_PRIV_X) && getMXR(riscv)) {
+    if((priv&MEM_PRIV_X) && MXR) {
         priv |= MEM_PRIV_R;
     }
 
-    if(mode==RISCV_MODE_U) {
+    if(getBaseMode(mode)==RISCV_MODE_U) {
 
         // no access in user mode unless U=1
         if(!entry->U) {
@@ -375,8 +560,8 @@ static memPriv checkEntryPermission(
 
     } else if(entry->U) {
 
-        // no access in supervisor mode if U=1 unless MSTATUS.SUM=1
-        if(!getSUM(riscv)) {
+        // no access in supervisor mode if U=1 unless xstatus.SUM=1
+        if(!SUM) {
             priv = MEM_PRIV_NONE;
         } else if(RISCV_PRIV_VERSION(riscv) >= RVPV_1_11) {
             // behavior from privileged architecture 1.11 only - never
@@ -445,13 +630,14 @@ inline static memDomainP getPTWDomain(riscvP riscv) {
 //
 static Uns64 readPageTableEntry(
     riscvP         riscv,
-    memDomainP     domain,
+    riscvMode      mode,
     Uns64          PTEAddr,
     Uns32          entryBytes,
     memAccessAttrs attrs
 ) {
-    memEndian endian = riscvGetDataEndian(riscv, RISCV_MODE_S);
-    Uns64     result;
+    memDomainP domain = getPTWDomain(riscv);
+    memEndian  endian = riscvGetDataEndian(riscv, getSMode(mode));
+    Uns64      result;
 
     // enter PTW context
     riscv->PTWActive  = True;
@@ -475,13 +661,14 @@ static Uns64 readPageTableEntry(
 //
 static void writePageTableEntry(
     riscvP         riscv,
-    memDomainP     domain,
+    riscvMode      mode,
     Uns64          PTEAddr,
     Uns32          entryBytes,
     memAccessAttrs attrs,
     Uns64          value
 ) {
-    memEndian endian = riscvGetDataEndian(riscv, RISCV_MODE_S);
+    memDomainP domain = getPTWDomain(riscv);
+    memEndian  endian = riscvGetDataEndian(riscv, getSMode(mode));
 
     // enter PTW context
     riscv->PTWActive  = True;
@@ -636,17 +823,20 @@ static riscvException handlePTWException(
         );
     }
 
+    // is this a stage 2 fault?
+    Bool S2 = (riscv->activeTLB==RISCV_TLB_VS2);
+
     // return appropriate exception
     if(desc->exception==PTX_LOAD_ACCESS) {
         return originalAccessFault(requiredPriv);
     } else if(desc->exception==PTX_STORE_ACCESS) {
         return originalAccessFault(requiredPriv);
     } else if(requiredPriv==MEM_PRIV_R) {
-        return riscv_E_LoadPageFault;
+        return S2 ? riscv_E_LoadGuestPageFault : riscv_E_LoadPageFault;
     } else if(requiredPriv==MEM_PRIV_W) {
-        return riscv_E_StoreAMOPageFault;
+        return S2 ? riscv_E_StoreAMOGuestPageFault : riscv_E_StoreAMOPageFault;
     } else {
-        return riscv_E_InstructionPageFault;
+        return S2 ? riscv_E_InstructionGuestPageFault : riscv_E_InstructionPageFault;
     }
 }
 
@@ -729,20 +919,19 @@ static riscvException tlbLookupSv32(
     memPriv        requiredPriv,
     memAccessAttrs attrs
 ) {
-    memDomainP domain = getPTWDomain(riscv);
-    Sv32VA     VA     = {raw : entry->lowVA};
-    Sv32PA     PA;
-    Sv32Entry  PTE;
-    Addr       PTEAddr;
-    Addr       a;
-    Int32      i;
+    Sv32VA    VA = {raw : entry->lowVA};
+    Sv32PA    PA;
+    Sv32Entry PTE;
+    Addr      PTEAddr;
+    Addr      a;
+    Int32     i;
 
     // clear page offset bits (not relevant for entry creation)
     VA.fields.pageOffset = 0;
 
     // do table walk to find ultimate PTE
     for(
-        i=1, a=getRootTableAddress(riscv, mode);
+        i=1, a=getRootTableAddress(riscv);
         i>=0;
         i--, a=getPTETableAddress(PTE.fields.PPN)
     ) {
@@ -750,7 +939,7 @@ static riscvException tlbLookupSv32(
         PTEAddr = a + getSv32VPNi(VA, i)*4;
 
         // read entry from memory
-        PTE.raw = readPageTableEntry(riscv, domain, PTEAddr, 4, attrs);
+        PTE.raw = readPageTableEntry(riscv, mode, PTEAddr, 4, attrs);
 
         // return with page-fault exception if an invalid entry or entry with
         // permission combination that is reserved, or break from the loop if
@@ -791,12 +980,12 @@ static riscvException tlbLookupSv32(
     entry->PA = PA.raw;
 
     // fill TLB entry attributes
+    entry->tlb  = riscv->activeTLB;
     entry->priv = PTE.fields.priv;
     entry->U    = PTE.fields.U;
     entry->G    = getG(riscv, PTE.fields.G);
     entry->A    = PTE.fields.A;
     entry->D    = PTE.fields.D;
-    entry->V    = modeIsVirtual(mode);
 
     // return with page-fault exception if permissions are invalid
     if(!checkEntryPermission(riscv, mode, entry, requiredPriv)) {
@@ -831,7 +1020,7 @@ static riscvException tlbLookupSv32(
     // write PTE if it has changed
     if(doWrite) {
 
-        writePageTableEntry(riscv, domain, PTEAddr, 4, attrs, PTE.raw);
+        writePageTableEntry(riscv, mode, PTEAddr, 4, attrs, PTE.raw);
 
         // error if entry is not writable
         if(riscv->PTWBadAddr) {
@@ -841,6 +1030,49 @@ static riscvException tlbLookupSv32(
 
     // entry is valid
     return 0;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Sv32x4 PAGE TABLE WALK
+////////////////////////////////////////////////////////////////////////////////
+
+//
+// This shift extracts the two extra bits for Sv32x4 mapping
+//
+#define SV32x4_SHIFT 32
+
+//
+// Look up any TLB entry for the passed address using Sv32x4 mode and fill byref
+// argument 'entry' with the details.
+//
+static riscvException tlbLookupSv32x4(
+    riscvP         riscv,
+    riscvMode      mode,
+    tlbEntryP      entry,
+    memPriv        requiredPriv,
+    memAccessAttrs attrs
+) {
+    Uns64 extraBits = entry->lowVA >> SV32x4_SHIFT;
+
+    // record additional stage 2 page offset
+    riscv->s2Offset = extraBits;
+
+    // get ignored bits for Sv32 translation
+    extraBits <<= SV32x4_SHIFT;
+
+    // use Sv32 lookup logic
+    riscvException exception = tlbLookupSv32(
+        riscv, mode, entry, requiredPriv, attrs
+    );
+
+    // include additional Sv32x4 offset if lookup succeeded
+    if(!exception) {
+        entry->lowVA  += extraBits;
+        entry->highVA += extraBits;
+    }
+
+    return exception;
 }
 
 
@@ -917,13 +1149,12 @@ static riscvException tlbLookupSv39(
     memPriv        requiredPriv,
     memAccessAttrs attrs
 ) {
-    memDomainP domain  = getPTWDomain(riscv);
-    Sv39VA     VA      = {raw : entry->lowVA};
-    Addr       PTEAddr = 0;
-    Sv39PA     PA;
-    Sv39Entry  PTE;
-    Addr       a;
-    Int32      i;
+    Sv39VA    VA      = {raw : entry->lowVA};
+    Addr      PTEAddr = 0;
+    Sv39PA    PA;
+    Sv39Entry PTE;
+    Addr      a;
+    Int32     i;
 
     // validate VPNextend correctly extends VPN
     if(!validVA(VA.fields.VPN, VA.fields.VPNextend)) {
@@ -935,7 +1166,7 @@ static riscvException tlbLookupSv39(
 
     // do table walk to find ultimate PTE
     for(
-        i=2, a=getRootTableAddress(riscv, mode);
+        i=2, a=getRootTableAddress(riscv);
         i>=0;
         i--, a=getPTETableAddress(PTE.fields.PPN)
     ) {
@@ -943,7 +1174,7 @@ static riscvException tlbLookupSv39(
         PTEAddr = a + getSv39VPNi(VA, i)*8;
 
         // read entry from memory
-        PTE.raw = readPageTableEntry(riscv, domain, PTEAddr, 8, attrs);
+        PTE.raw = readPageTableEntry(riscv, mode, PTEAddr, 8, attrs);
 
         // return with page-fault exception if an invalid entry or entry with
         // permission combination that is reserved, or break from the loop if
@@ -984,12 +1215,12 @@ static riscvException tlbLookupSv39(
     entry->PA = PA.raw;
 
     // fill TLB entry attributes
+    entry->tlb  = riscv->activeTLB;
     entry->priv = PTE.fields.priv;
     entry->U    = PTE.fields.U;
     entry->G    = getG(riscv, PTE.fields.G);
     entry->A    = PTE.fields.A;
     entry->D    = PTE.fields.D;
-    entry->V    = modeIsVirtual(mode);
 
     // return with page-fault exception if permissions are invalid
     if(!checkEntryPermission(riscv, mode, entry, requiredPriv)) {
@@ -1024,7 +1255,7 @@ static riscvException tlbLookupSv39(
     // write PTE if it has changed
     if(doWrite) {
 
-        writePageTableEntry(riscv, domain, PTEAddr, 8, attrs, PTE.raw);
+        writePageTableEntry(riscv, mode, PTEAddr, 8, attrs, PTE.raw);
 
         // error if entry is not writable
         if(riscv->PTWBadAddr) {
@@ -1034,6 +1265,58 @@ static riscvException tlbLookupSv39(
 
     // entry is valid
     return 0;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Sv39x4 PAGE TABLE WALK
+////////////////////////////////////////////////////////////////////////////////
+
+//
+// This shift extracts the two extra bits for Sv39x4 mapping
+//
+#define SV39x4_SHIFT 39
+
+//
+// Look up any TLB entry for the passed address using Sv39x4 mode and fill byref
+// argument 'entry' with the details.
+//
+static riscvException tlbLookupSv39x4(
+    riscvP         riscv,
+    riscvMode      mode,
+    tlbEntryP      entry,
+    memPriv        requiredPriv,
+    memAccessAttrs attrs
+) {
+    Uns64 extraBits = entry->lowVA >> SV39x4_SHIFT;
+
+    // validate VPNextend correctly extends VPN
+    if(extraBits>3) {
+        Addr PTEAddr = 0;
+        PTE_ERROR(VAEXTEND);
+    }
+
+    // record additional stage 2 page offset
+    riscv->s2Offset = extraBits;
+
+    // get ignored bits for Sv39 translation
+    extraBits <<= SV39x4_SHIFT;
+
+    // remove ignored bits from Sv39 virtual address
+    entry->lowVA -= extraBits;
+
+    // use Sv39 lookup logic
+    riscvException exception = tlbLookupSv39(
+        riscv, mode, entry, requiredPriv, attrs
+    );
+
+    // include additional Sv39x4 offset if lookup succeeded
+    if(!exception) {
+        entry->lowVA  += extraBits;
+        entry->highVA += extraBits;
+    }
+
+    return exception;
 }
 
 
@@ -1110,13 +1393,12 @@ static riscvException tlbLookupSv48(
     memPriv        requiredPriv,
     memAccessAttrs attrs
 ) {
-    memDomainP domain  = getPTWDomain(riscv);
-    Sv48VA     VA      = {raw : entry->lowVA};
-    Addr       PTEAddr = 0;
-    Sv48PA     PA;
-    Sv48Entry  PTE;
-    Addr       a;
-    Int32      i;
+    Sv48VA    VA      = {raw : entry->lowVA};
+    Addr      PTEAddr = 0;
+    Sv48PA    PA;
+    Sv48Entry PTE;
+    Addr      a;
+    Int32     i;
 
     // validate VPNextend correctly extends VPN
     if(!validVA(VA.fields.VPN, VA.fields.VPNextend)) {
@@ -1128,7 +1410,7 @@ static riscvException tlbLookupSv48(
 
     // do table walk to find ultimate PTE
     for(
-        i=3, a=getRootTableAddress(riscv, mode);
+        i=3, a=getRootTableAddress(riscv);
         i>=0;
         i--, a=getPTETableAddress(PTE.fields.PPN)
     ) {
@@ -1136,7 +1418,7 @@ static riscvException tlbLookupSv48(
         PTEAddr = a + getSv48VPNi(VA, i)*8;
 
         // read entry from memory
-        PTE.raw = readPageTableEntry(riscv, domain, PTEAddr, 8, attrs);
+        PTE.raw = readPageTableEntry(riscv, mode, PTEAddr, 8, attrs);
 
         // return with page-fault exception if an invalid entry or entry with
         // permission combination that is reserved, or break from the loop if
@@ -1177,12 +1459,12 @@ static riscvException tlbLookupSv48(
     entry->PA = PA.raw;
 
     // fill TLB entry attributes
+    entry->tlb  = riscv->activeTLB;
     entry->priv = PTE.fields.priv;
     entry->U    = PTE.fields.U;
     entry->G    = getG(riscv, PTE.fields.G);
     entry->A    = PTE.fields.A;
     entry->D    = PTE.fields.D;
-    entry->V    = modeIsVirtual(mode);
 
     // return with page-fault exception if permissions are invalid
     if(!checkEntryPermission(riscv, mode, entry, requiredPriv)) {
@@ -1217,7 +1499,7 @@ static riscvException tlbLookupSv48(
     // write PTE if it has changed
     if(doWrite) {
 
-        writePageTableEntry(riscv, domain, PTEAddr, 8, attrs, PTE.raw);
+        writePageTableEntry(riscv, mode, PTEAddr, 8, attrs, PTE.raw);
 
         // error if entry is not writable
         if(riscv->PTWBadAddr) {
@@ -1227,6 +1509,58 @@ static riscvException tlbLookupSv48(
 
     // entry is valid
     return 0;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Sv48x4 PAGE TABLE WALK
+////////////////////////////////////////////////////////////////////////////////
+
+//
+// This shift extracts the two extra bits for Sv48x4 mapping
+//
+#define SV48x4_SHIFT 48
+
+//
+// Look up any TLB entry for the passed address using Sv48x4 mode and fill byref
+// argument 'entry' with the details.
+//
+static riscvException tlbLookupSv48x4(
+    riscvP         riscv,
+    riscvMode      mode,
+    tlbEntryP      entry,
+    memPriv        requiredPriv,
+    memAccessAttrs attrs
+) {
+    Uns64 extraBits = entry->lowVA >> SV48x4_SHIFT;
+
+    // validate VPNextend correctly extends VPN
+    if(extraBits>3) {
+        Addr PTEAddr = 0;
+        PTE_ERROR(VAEXTEND);
+    }
+
+    // record additional stage 2 page offset
+    riscv->s2Offset = extraBits;
+
+    // get ignored bits for Sv48 translation
+    extraBits <<= SV48x4_SHIFT;
+
+    // remove ignored bits from Sv48 virtual address
+    entry->lowVA -= extraBits;
+
+    // use Sv48 lookup logic
+    riscvException exception = tlbLookupSv48(
+        riscv, mode, entry, requiredPriv, attrs
+    );
+
+    // include additional Sv48x4 offset if lookup succeeded
+    if(!exception) {
+        entry->lowVA  += extraBits;
+        entry->highVA += extraBits;
+    }
+
+    return exception;
 }
 
 
@@ -1252,14 +1586,14 @@ static void deleteTLBEntryMappingsMode(
     Uns32 modeMask = getModeMask(mode);
 
     // action is only needed if the TLB entry is mapped in this mode
-    if(entry->isMapped & modeMask) {
+    if(entry->mapped & modeMask) {
 
         memDomainP dataDomain = getVirtDomainCorD(riscv, mode, False);
         memDomainP codeDomain = getVirtDomainCorD(riscv, mode, True);
         Uns64      lowVA      = getEntryLowVA(entry);
         Uns64      highVA     = getEntryHighVA(entry);
-        Uns32      fullASID   = getEntrySimASID(entry);
-        Uns32      ASIDMask   = getEntryASIDMask(entry, mode);
+        Uns64      fullASID   = getEntrySimASID(entry);
+        Uns64      ASIDMask   = getEntryASIDMask(entry, mode);
 
         if(dataDomain) {
             vmirtUnaliasMemoryVM(dataDomain, lowVA, highVA, ASIDMask, fullASID);
@@ -1270,19 +1604,28 @@ static void deleteTLBEntryMappingsMode(
         }
 
         // indicate entry is no longer mapped in this mode
-        entry->isMapped &= ~modeMask;
+        entry->mapped &= ~modeMask;
     }
 }
 
 //
-// Is the mode a virtually-mapped mode with the same virtualization satate as
-// TLB entry?
+// Remove memory mappings for a TLB entry in the given mode if the simulated
+// ASID does not match
 //
-static Bool matchTLBEntryVirtual(tlbEntryP entry, riscvMode mode) {
-    return (
-        (getBaseMode(mode)<=RISCV_MODE_S) &&
-        (entry->V==modeIsVirtual(mode))
-    );
+static void deleteTLBEntryMappingsModeASID(
+    riscvP       riscv,
+    tlbEntryP    entry,
+    riscvMode    mode,
+    riscvSimASID newASID
+) {
+    Uns64 ASIDMask   = getEntryASIDMask(entry, mode);
+    Uns64 oldASIDU64 = ASIDMask & getEntrySimASID(entry);
+    Uns64 newASIDU64 = ASIDMask & newASID.u64;
+
+    // action is only needed if effective ASID in the given mode changes
+    if(oldASIDU64 != newASIDU64) {
+        deleteTLBEntryMappingsMode(riscv, entry, mode);
+    }
 }
 
 //
@@ -1290,13 +1633,22 @@ static Bool matchTLBEntryVirtual(tlbEntryP entry, riscvMode mode) {
 //
 static void unmapTLBEntry(riscvP riscv, tlbEntryP entry) {
 
-    riscvMode mode;
+    switch(entry->tlb) {
 
-    // delete mappings in all privilege levels
-    for(mode=0; mode<RISCV_MODE_LAST; mode++) {
-        if(matchTLBEntryVirtual(entry, mode)) {
-            deleteTLBEntryMappingsMode(riscv, entry, mode);
-        }
+        case RISCV_TLB_HS:
+            deleteTLBEntryMappingsMode(riscv, entry, RISCV_MODE_U);
+            deleteTLBEntryMappingsMode(riscv, entry, RISCV_MODE_S);
+            break;
+
+        case RISCV_TLB_VS1:
+        case RISCV_TLB_VS2:
+            deleteTLBEntryMappingsMode(riscv, entry, RISCV_MODE_VU);
+            deleteTLBEntryMappingsMode(riscv, entry, RISCV_MODE_VS);
+            break;
+
+        default:
+            VMI_ABORT("Invalid tlb %u", entry->tlb); // LCOV_EXCL_LINE
+            break;
     }
 }
 
@@ -1309,22 +1661,24 @@ static void unmapTLBEntryNewASID(
     tlbEntryP    entry,
     riscvSimASID newASID
 ) {
-    riscvMode mode;
+    switch(entry->tlb) {
 
-    for(mode=0; mode<RISCV_MODE_LAST; mode++) {
+        case RISCV_TLB_HS:
+            deleteTLBEntryMappingsModeASID(riscv, entry, RISCV_MODE_U, newASID);
+            deleteTLBEntryMappingsModeASID(riscv, entry, RISCV_MODE_S, newASID);
+            break;
 
-        if(matchTLBEntryVirtual(entry, mode)) {
+        case RISCV_TLB_VS1:
+        case RISCV_TLB_VS2:
+            deleteTLBEntryMappingsModeASID(riscv, entry, RISCV_MODE_VU, newASID);
+            deleteTLBEntryMappingsModeASID(riscv, entry, RISCV_MODE_VS, newASID);
+            break;
 
-            Uns32 ASIDMask   = getEntryASIDMask(entry, mode);
-            Uns32 oldASIDU32 = ASIDMask & getEntrySimASID(entry);
-            Uns32 newASIDU32 = ASIDMask & newASID.u32;
-
-            // action is only needed if effective ASID in the given mode changes
-            if(oldASIDU32 != newASIDU32) {
-                deleteTLBEntryMappingsMode(riscv, entry, mode);
-            }
-        }
+        default:
+            VMI_ABORT("Invalid tlb %u", entry->tlb); // LCOV_EXCL_LINE
+            break;
     }
+
 }
 
 //
@@ -1386,7 +1740,7 @@ inline static void reportDeleteTLBEntry(riscvP riscv, tlbEntryP entry) {
 static void deleteTLBEntry(riscvP riscv, riscvTLBP tlb, tlbEntryP entry) {
 
     // remove entry mappings if required
-    if(entry->isMapped) {
+    if(entry->mapped) {
         unmapTLBEntry(riscv, entry);
     }
 
@@ -1426,6 +1780,10 @@ static void deleteTLBEntryMode(
 
         // delete entry irrespective of ASID
         delete = True;
+
+    } else if(!matchVMID(RD_CSR_FIELD(riscv, hgatp, VMID), entry)) {
+
+        // preserve VMID-mapped entry with differing VMID
 
     } else if(!getASIDMask(riscv)) {
 
@@ -1565,13 +1923,15 @@ static tlbEntryP nextTLBEntryRange(
 // If mode is MM_ASID, then any matching non-global entry is deleted
 //
 static void invalidateTLBEntriesRange(
-    riscvP    riscv,
-    riscvTLBP tlb,
-    Uns64     lowVA,
-    Uns64     highVA,
-    matchMode mode,
-    Uns32     ASID
+    riscvP     riscv,
+    riscvTLBId id,
+    Uns64      lowVA,
+    Uns64      highVA,
+    matchMode  mode,
+    Uns32      ASID
 ) {
+    riscvTLBP tlb = riscv->tlb[id];
+
     if(tlb) {
         ITER_TLB_ENTRY_RANGE(
             riscv, tlb, lowVA, highVA, entry,
@@ -1596,14 +1956,16 @@ static riscvTLBP newTLB(riscvP riscv) {
 //
 // Free TLB structure
 //
-static void freeTLB(riscvP riscv, riscvTLBP tlb) {
+static void freeTLB(riscvP riscv, riscvTLBId id) {
+
+    riscvTLBP tlb = riscv->tlb[id];
 
     if(tlb) {
 
         tlbEntryP entry;
 
         // delete all entries in the TLB (puts them in the free list)
-        invalidateTLBEntriesRange(riscv, tlb, 0, RISCV_MAX_ADDR, MM_ANY, 0);
+        invalidateTLBEntriesRange(riscv, id, 0, RISCV_MAX_ADDR, MM_ANY, 0);
 
         // release entries in the free list
         while((entry=tlb->free)) {
@@ -1850,15 +2212,66 @@ static void createTMDomain(riscvP riscv) {
 }
 
 //
-// Dump the contents of the TLBs
+// Common utility for command to dump a TLB
 //
-static VMIRT_COMMAND_PARSE_FN(dumpTLBCommand) {
+static const char *dumpTLBCommon(vmiProcessorP processor, riscvTLBId id) {
 
     riscvP riscv = (riscvP)processor;
 
-    dumpTLB(riscv, riscv->tlb);
+    dumpTLB(riscv, riscv->tlb[id]);
 
     return "1";
+}
+
+//
+// Dump the contents of the HS TLB
+//
+static VMIRT_COMMAND_PARSE_FN(dumpHSTLBCommand) {
+    return dumpTLBCommon(processor, RISCV_TLB_HS);
+}
+
+//
+// Dump the contents of the virtual stage 1 TLB
+//
+static VMIRT_COMMAND_PARSE_FN(dumpVS1TLBCommand) {
+    return dumpTLBCommon(processor, RISCV_TLB_VS1);
+}
+
+//
+// Dump the contents of the virtual stage 2 TLB
+//
+static VMIRT_COMMAND_PARSE_FN(dumpVS2TLBCommand) {
+    return dumpTLBCommon(processor, RISCV_TLB_VS2);
+}
+
+//
+// Create a TLB and associated command to dump it
+//
+static void createTLB(riscvP riscv, riscvTLBId id) {
+
+    typedef struct tlbInfoS {
+        vmirtCommandParseFn commandCB;
+        const char         *name;
+        const char         *desc;
+    } tlbInfo;
+
+    static const tlbInfo info[] = {
+        [RISCV_TLB_HS]  = {dumpHSTLBCommand,  "dumpTLB",    "show TLB contents"},
+        [RISCV_TLB_VS1] = {dumpVS1TLBCommand, "dumpVS1TLB", "show VS1 TLB contents"},
+        [RISCV_TLB_VS2] = {dumpVS2TLBCommand, "dumpVS2TLB", "show VS2 TLB contents"},
+    };
+
+    // initialize TLB
+    riscv->tlb[id] = newTLB(riscv);
+
+    // dumpTLB command
+    vmirtAddCommandParse(
+        (vmiProcessorP)riscv,
+        info[id].name,
+        info[id].desc,
+        info[id].commandCB,
+        VMI_CT_QUERY|VMI_CO_TLB|VMI_CA_QUERY
+    );
 }
 
 //
@@ -1961,37 +2374,31 @@ VMI_VMINIT_FN(riscvVMInit) {
     // create transaction mode domain
     createTMDomain(riscv);
 
+    // initialize HS TLB if required
     if(riscvHasMode(riscv, RISCV_MODE_S)) {
+        createTLB(riscv, RISCV_TLB_HS);
+    }
 
-        // initialize TLB
-        riscv->tlb = newTLB(riscv);
-
-        // dumpTLB command
-        vmirtAddCommandParse(
-            processor,
-            "dumpTLB",
-            "show TLB contents",
-            dumpTLBCommand,
-            VMI_CT_QUERY|VMI_CO_TLB|VMI_CA_QUERY
-        );
+    // initialize VS TLB if required
+    if(riscvHasMode(riscv, RISCV_MODE_VS)) {
+        createTLB(riscv, RISCV_TLB_VS1);
+        createTLB(riscv, RISCV_TLB_VS2);
     }
 }
 
 //
 // Return any TLB entry for the passed address which matches the current ASID
+// and VMID
 //
-static tlbEntryP findTLBEntry(
-    riscvP    riscv,
-    riscvMode mode,
-    riscvTLBP tlb,
-    Uns64     VA
-) {
-    Uns32 ASID = getActiveASID(riscv, mode);
+static tlbEntryP findTLBEntry(riscvP riscv, riscvTLBP tlb, Uns64 VA) {
+
+    Uns32 ASID = getActiveASID(riscv);
+    Uns32 VMID = getActiveVMID(riscv);
 
     // return any entry with matching MVA, ASID and VMID
     ITER_TLB_ENTRY_RANGE(
         riscv, tlb, VA, VA, entry,
-        if(matchASID(ASID, entry)) {
+        if(matchVMID(VMID, entry) && matchASID(ASID, entry)) {
             return entry;
         }
     );
@@ -2009,16 +2416,16 @@ static void initialEntry(tlbEntryP entry, riscvP riscv, Uns64 VA) {
 
 //
 // Look up any TLB entry for the passed address and fill byref argument 'entry'
-// with the details.
+// with the details (stage 1 TLB)
 //
-static riscvException tlbLookup(
+static riscvException tlbLookupS1(
     riscvP         riscv,
     riscvMode      mode,
     tlbEntryP      entry,
     memPriv        requiredPriv,
     memAccessAttrs attrs
 ) {
-    Bool           V      = modeIsVirtual(mode);
+    Bool           V      = activeTLBIsVirtual(riscv);
     VAMode         vaMode = RD_CSR_FIELD_V(riscv, satp, V, MODE);
     riscvException result = 0;
 
@@ -2036,6 +2443,61 @@ static riscvException tlbLookup(
 }
 
 //
+// Look up any TLB entry for the passed address and fill byref argument 'entry'
+// with the details (stage 2 TLB)
+//
+static riscvException tlbLookupS2(
+    riscvP         riscv,
+    riscvMode      mode,
+    tlbEntryP      entry,
+    memPriv        requiredPriv,
+    memAccessAttrs attrs
+) {
+    VAMode         vaMode = RD_CSR_FIELD(riscv, hgatp, MODE);
+    riscvException result = 0;
+    Uns64          GPA    = entry->lowVA>>2;
+
+    if(vaMode==VAM_Sv32) {
+        result = tlbLookupSv32x4(riscv, mode, entry, requiredPriv, attrs);
+    } else if(vaMode==VAM_Sv39) {
+        result = tlbLookupSv39x4(riscv, mode, entry, requiredPriv, attrs);
+    } else if(vaMode==VAM_Sv48) {
+        result = tlbLookupSv48x4(riscv, mode, entry, requiredPriv, attrs);
+    } else {
+        VMI_ABORT("Invalid VA mode"); // LCOV_EXCL_LINE
+    }
+
+    // log failing virtual address if required
+    if(result) {
+        riscv->GPA = GPA;
+    }
+
+    return result;
+}
+
+//
+// Look up any TLB entry for the passed address and fill byref argument 'entry'
+// with the details.
+//
+static riscvException tlbLookup(
+    riscvP         riscv,
+    riscvMode      mode,
+    tlbEntryP      entry,
+    memPriv        requiredPriv,
+    memAccessAttrs attrs
+) {
+    riscvException result;
+
+    if(!activeTLBIsVS2(riscv)) {
+        result = tlbLookupS1(riscv, mode, entry, requiredPriv, attrs);
+    } else {
+        result = tlbLookupS2(riscv, mode, entry, requiredPriv, attrs);
+    }
+
+    return result;
+}
+
+//
 // Take exception on invalid access
 //
 static void handleInvalidAccess(
@@ -2044,9 +2506,20 @@ static void handleInvalidAccess(
     memAccessAttrs attrs,
     riscvException exception
 ) {
-    if(!MEM_AA_IS_ARTIFACT_ACCESS(attrs)) {
-        riscvTakeMemoryException(riscv, exception, VA);
+    // report original virtual address for second stage translation failure
+    if(riscv->s2Active) {
+        VA = riscv->s1VA;
     }
+
+    // take exception only if not an artifact access
+    if(!MEM_AA_IS_ARTIFACT_ACCESS(attrs)) {
+        riscv->GVA = activeTLBIsVirtual(riscv);
+        riscvTakeMemoryException(riscv, exception, VA);
+        riscv->GVA = False;
+    }
+
+    // clear down pending exception GPA
+    riscv->GPA = 0;
 }
 
 //
@@ -2075,7 +2548,7 @@ static tlbEntryP validateTLBEntryPriv(
 
         // writing using an entry not marked as dirty: discard the entry and
         // reload it (will write the entry marked as dirty)
-        deleteTLBEntry(riscv, riscv->tlb, entry);
+        deleteTLBEntry(riscv, getActiveTLB(riscv), entry);
         entry = 0;
 
     } else {
@@ -2101,12 +2574,12 @@ static tlbEntryP findOrCreateTLBEntry(
     memAccessAttrs attrs,
     tlbMapInfoP    miP
 ) {
-    riscvTLBP tlb          = riscv->tlb;
+    riscvTLBP tlb          = getActiveTLB(riscv);
     Uns64     VA           = miP->lowVA;
     memPriv   requiredPriv = miP->priv;
 
     // get any existing entry for this VA
-    tlbEntryP entry = findTLBEntry(riscv, mode, tlb, VA);
+    tlbEntryP entry = findTLBEntry(riscv, tlb, VA);
 
     // if entry exists, validate permissions (NOTE: this may delete the entry
     // if a write and D=0)
@@ -2775,30 +3248,70 @@ static void mapPMA(
 //
 static void mapTLBEntry(
     riscvP      riscv,
-    tlbEntryP   entry,
+    Uns64       VA,
+    Uns64       GPA,
+    tlbEntryP   entry1,
+    tlbEntryP   entry2,
     memDomainP  domainV,
     riscvMode   mode,
     memPriv     requiredPriv,
     tlbMapInfoP miP
 ) {
     memDomainP domainP    = getPMPDomainPriv(riscv, mode, requiredPriv);
-    Uns64      lowPA      = getEntryLowPA(entry);
-    Uns64      highPA     = getEntryHighPA(entry);
-    Uns64      lowVA      = getEntryLowVA(entry);
-    Uns32      ASIDMask   = getEntryASIDMask(entry, mode);
-    Uns32      ASID       = getEntrySimASID(entry);
     memPriv    priv       = miP->priv;
-    Uns64      size       = highPA-lowPA+1;
     Uns64      vmiPageMax = 0x100000000ULL;
-    Uns64      VAtoPA     = lowPA-lowVA;
+
+    // get stage 1 entry details
+    Uns64 lowVA    = getEntryLowVA(entry1);
+    Uns64 highVA   = getEntryHighVA(entry1);
+    Uns64 ASIDMask = getEntryASIDMask(entry1, mode);
+    Uns64 ASID     = getEntrySimASID(entry1);
+    Uns64 VAtoPA   = getEntryVAtoPA(entry1);
 
     // restrict mapping size to VMI maximum (4Gb)
-    if(size>vmiPageMax) {
-        size   = vmiPageMax;
-        lowVA  = miP->lowVA & -size;
-        lowPA  = lowVA + VAtoPA;
-        highPA = lowPA + size - 1;
+    if(getEntrySize(entry1)>vmiPageMax) {
+        lowVA  = miP->lowVA & -vmiPageMax;
+        highVA = lowVA + vmiPageMax - 1;
     }
+
+    // combine information from stage 2 if required
+    if(entry2) {
+
+        // get stage 2 entry details
+        Uns64 lowVA2    = getEntryLowVA(entry2);
+        Uns64 highVA2   = getEntryHighVA(entry2);
+        Uns64 ASIDMask2 = getEntryASIDMask(entry2, mode);
+        Uns64 VAtoPA2   = getEntryVAtoPA(entry2);
+
+        // calculate offsets of translated address from the low and high bounds
+        // of stage 1 and stage 2 entries
+        Uns64 loDelta1 = VA  - lowVA;
+        Uns64 loDelta2 = GPA - lowVA2;
+        Uns64 hiDelta1 = highVA  - VA;
+        Uns64 hiDelta2 = highVA2 - GPA;
+
+        // adjust lower region bound upwards if stage 2 entry has higher low
+        // bound
+        if(loDelta1>loDelta2) {
+            lowVA += (loDelta1 - loDelta2);
+        }
+
+        // adjust upper region bound downwards if stage 2 entry has lower high
+        // bound
+        if(hiDelta1>hiDelta2) {
+            highVA -= (hiDelta1 - hiDelta2);
+        }
+
+        // include stage 2 shift to true physical address
+        VAtoPA += VAtoPA2;
+
+        // merge ASID masks
+        ASIDMask |= ASIDMask2;
+    }
+
+    // determine physical bounds of mapped region
+    Uns64 lowPA  = lowVA  + VAtoPA;
+    Uns64 highPA = highVA + VAtoPA;
 
     // create virtual mapping
     vmirtAliasMemoryVM(
@@ -2816,11 +3329,46 @@ static void mapTLBEntry(
     mapPMA(riscv, mode, requiredPriv, lowPA, highPA);
 
     // indicate entry is mapped in this mode
-    entry->isMapped |= getModeMask(mode);
+    entry1->mapped |= getModeMask(mode);
 
     // indicate mapped range
     miP->lowVA  = lowVA;
-    miP->highVA = lowVA + size - 1;
+    miP->highVA = highVA;
+}
+
+//
+// Attempt to map a TLB entry for the given stage
+//
+static tlbEntryP getTLBStageEntry(
+    riscvP         riscv,
+    riscvTLBId     id,
+    riscvMode      mode,
+    tlbMapInfoP    miP,
+    memAccessAttrs attrs
+) {
+    // activate the indicated TLB
+    riscvTLBId oldTLB = activateTLB(riscv, id);
+
+    // do TLB mapping
+    tlbEntryP entry = findOrCreateTLBEntry(riscv, mode, attrs, miP);
+
+    if(entry) {
+
+        // create full simulated ASID (including xstatus bits)
+        riscvSimASID simASID = getSimASID(riscv);
+
+        // if the entry was previously mapped with a different simulated ASID,
+        // unmap it in affected domains (handles changes in xstatus bits)
+        unmapTLBEntryNewASID(riscv, entry, simASID);
+
+        // save full simulated ASID for use when the entry is unmapped
+        entry->simASID = simASID;
+    }
+
+    // restore previously-active TLB
+    deactivateTLB(riscv, oldTLB);
+
+    return entry;
 }
 
 //
@@ -2834,31 +3382,54 @@ static Bool tlbMiss(
     tlbMapInfoP    miP,
     memAccessAttrs attrs
 ) {
-    memPriv requiredPriv = miP->priv;
+    riscvTLBId id           = getCurrentTLBId(riscv);
+    memPriv    requiredPriv = miP->priv;
+    Uns64      VA           = miP->lowVA;
+    Uns64      GPA          = VA;
 
-    // do TLB mapping
-    tlbEntryP entry = findOrCreateTLBEntry(riscv, mode, attrs, miP);
+    // map the current stage TLB entry
+    tlbEntryP entry1 = getTLBStageEntry(riscv, id, mode, miP, attrs);
+    tlbEntryP entry2 = 0;
 
-    // handle absent entries
-    if(!entry) {
-        return True;
+    // map second stage TLB entry if required
+    if(entry1 && (id==RISCV_TLB_VS1) && RD_CSR_FIELD(riscv, hgatp, MODE)) {
+
+        // indicate second stage access is active with the stage 1 VA
+        riscv->s2Active = True;
+        riscv->s1VA     = VA;
+
+        // determine guest physical address
+        GPA = VA + entry1->PA - entry1->lowVA;
+
+        tlbMapInfo mi2 = {lowVA:GPA, priv:requiredPriv};
+
+        // map second stage TLB entry
+        entry2 = getTLBStageEntry(riscv, RISCV_TLB_VS2, mode, &mi2, attrs);
+
+        if(!entry2) {
+
+            // disable mapping if second stage fails
+            entry1 = 0;
+
+        } else {
+
+            // merge access privileges
+            miP->priv &= (mi2.priv | (MEM_PRIV_USER|MEM_PRIV_ALIGN));
+            miP->priv |= (mi2.priv & (MEM_PRIV_USER|MEM_PRIV_ALIGN));
+        }
+
+        // indicate second stage access is inactive
+        riscv->s2Active = False;
     }
 
-    // create full simulated ASID (including MSTATUS bits)
-    riscvSimASID simASID = getSimASID(riscv);
+    // create entry mapping if required
+    if(entry1) {
+        mapTLBEntry(
+            riscv, VA, GPA, entry1, entry2, domain, mode, requiredPriv, miP
+        );
+    }
 
-    // if the entry was previously mapped with a different simulated ASID,
-    // unmap it in affected domains (handles changes in MSTATUS bits)
-    unmapTLBEntryNewASID(riscv, entry, simASID);
-
-    // save full simulated ASID for use when the entry is unmapped
-    entry->simASID = simASID;
-
-    // create entry mapping
-    mapTLBEntry(riscv, entry, domain, mode, requiredPriv, miP);
-
-    // indicate TLB entry permissions are ok
-    return False;
+    return !entry1;
 }
 
 
@@ -2968,14 +3539,19 @@ Bool riscvVMMiss(
 // Free structures used for virtual memory management
 //
 void riscvVMFree(riscvP riscv) {
-    freeTLB(riscv, riscv->tlb);
+
+    riscvTLBId id;
+
+    for(id=0; id<RISCV_TLB_LAST; id++) {
+        freeTLB(riscv, id);
+    }
 }
 
 //
 // Perform any required memory mapping updates on an ASID change
 //
 void riscvVMSetASID(riscvP riscv) {
-    vmirtSetProcessorASID((vmiProcessorP)riscv, getSimASID(riscv).u32);
+    vmirtSetProcessorASID((vmiProcessorP)riscv, getSimASID(riscv).u64);
 }
 
 //
@@ -3002,31 +3578,59 @@ static Uns32 maskASID(riscvP riscv, Uns32 ASID) {
 //
 // Invalidate entire TLB
 //
+static void invalidateAll(riscvP riscv, riscvTLBId id) {
+    invalidateTLBEntriesRange(riscv, id, 0, RISCV_MAX_ADDR, MM_ANY, 0);
+}
+
+//
+// Invalidate entire TLB with matching ASID
+//
+static void invalidateAllASID(riscvP riscv, Uns32 ASID, riscvTLBId id) {
+    ASID = maskASID(riscv, ASID);
+    invalidateTLBEntriesRange(riscv, id, 0, RISCV_MAX_ADDR, MM_ASID, ASID);
+}
+
+//
+// Invalidate TLB entries for the given address
+//
+static void invalidateVA(riscvP riscv, Uns64 VA, riscvTLBId id) {
+    invalidateTLBEntriesRange(riscv, id, VA, VA, MM_ANY, 0);
+}
+
+//
+// Invalidate TLB entries with matching address and ASID
+//
+static void invalidateVAASID(riscvP riscv, Uns64 VA, Uns32 ASID, riscvTLBId id) {
+    ASID = maskASID(riscv, ASID);
+    invalidateTLBEntriesRange(riscv, id, VA, VA, MM_ASID, ASID);
+}
+
+//
+// Invalidate entire TLB
+//
 void riscvVMInvalidateAll(riscvP riscv) {
-    invalidateTLBEntriesRange(riscv, riscv->tlb, 0, RISCV_MAX_ADDR, MM_ANY, 0);
+    invalidateAll(riscv, getS1TLBId(riscv));
 }
 
 //
 // Invalidate entire TLB with matching ASID
 //
 void riscvVMInvalidateAllASID(riscvP riscv, Uns32 ASID) {
-    ASID = maskASID(riscv, ASID);
-    invalidateTLBEntriesRange(riscv, riscv->tlb, 0, RISCV_MAX_ADDR, MM_ASID, ASID);
+    invalidateAllASID(riscv, ASID, getS1TLBId(riscv));
 }
 
 //
 // Invalidate TLB entries for the given address
 //
 void riscvVMInvalidateVA(riscvP riscv, Uns64 VA) {
-    invalidateTLBEntriesRange(riscv, riscv->tlb, VA, VA, MM_ANY, 0);
+    invalidateVA(riscv, VA, getS1TLBId(riscv));
 }
 
 //
 // Invalidate TLB entries with matching address and ASID
 //
 void riscvVMInvalidateVAASID(riscvP riscv, Uns64 VA, Uns32 ASID) {
-    ASID = maskASID(riscv, ASID);
-    invalidateTLBEntriesRange(riscv, riscv->tlb, VA, VA, MM_ASID, ASID);
+    invalidateVAASID(riscv, VA, ASID, getS1TLBId(riscv));
 }
 
 //
@@ -3036,8 +3640,6 @@ void riscvVMRefreshMPRVDomain(riscvP riscv) {
 
     // get current VM enable and mode
     riscvMode  mode   = getCurrentMode5(riscv);
-    Bool       V      = modeIsVirtual(mode);
-    Bool       VM     = RD_CSR_FIELD_V(riscv, satp, V, MODE);
     memDomainP domain = 0;
 
     // if mstatus.MPRV is set, use that mode
@@ -3063,7 +3665,26 @@ void riscvVMRefreshMPRVDomain(riscvP riscv) {
             );
         }
 
+        // include previous virtual mode setting
+        if(modeMPP==RISCV_MODE_M) {
+            // no action
+        } else if(RD_CSR_FIELD_ALT(riscv, mstatush, mstatus, MPV)) {
+            modeMPP |= RISCV_MODE_V;
+        }
+
         mode = modeMPP;
+    }
+
+    Bool V  = modeIsVirtual(mode);
+    Bool VM = False;
+
+    // determine whether virtual memory is enabled in the target mode
+    if(mode==RISCV_MODE_M) {
+        // no action
+    } else if(RD_CSR_FIELD_V(riscv, satp, V, MODE)) {
+        VM = True;
+    } else if(V && RD_CSR_FIELD(riscv, hgatp, MODE)) {
+        VM = True;
     }
 
     // record data access mode (affects endianness)
@@ -3106,7 +3727,7 @@ static void saveTLBEntry(vmiSaveContextP cxt, tlbEntryP entry) {
     tlbEntry entryS = *entry;
 
     // clear down properties used to manage mapping
-    entryS.isMapped = 0;
+    entryS.mapped   = 0;
     entryS.lutEntry = 0;
 
     vmirtSaveElement(
@@ -3167,10 +3788,15 @@ static void restoreTLB(riscvP riscv, riscvTLBP tlb, vmiRestoreContextP cxt) {
 //
 static void saveVM(riscvP riscv, vmiSaveContextP cxt) {
 
-    riscvTLBP tlb = riscv->tlb;
+    riscvTLBId id;
 
-    if(tlb) {
-        saveTLB(riscv, tlb, cxt);
+    for(id=0; id<RISCV_TLB_LAST; id++) {
+
+        riscvTLBP tlb = riscv->tlb[id];
+
+        if(tlb) {
+            saveTLB(riscv, tlb, cxt);
+        }
     }
 }
 
@@ -3179,11 +3805,16 @@ static void saveVM(riscvP riscv, vmiSaveContextP cxt) {
 //
 static void restoreVM(riscvP riscv, vmiRestoreContextP cxt) {
 
-    riscvTLBP tlb = riscv->tlb;
+    riscvTLBId id;
 
-    if(tlb) {
-        invalidateTLBEntriesRange(riscv, tlb, 0, RISCV_MAX_ADDR, MM_ANY, 0);
-        restoreTLB(riscv, tlb, cxt);
+    for(id=0; id<RISCV_TLB_LAST; id++) {
+
+        riscvTLBP tlb = riscv->tlb[id];
+
+        if(tlb) {
+            invalidateTLBEntriesRange(riscv, id, 0, RISCV_MAX_ADDR, MM_ANY, 0);
+            restoreTLB(riscv, tlb, cxt);
+        }
     }
 }
 

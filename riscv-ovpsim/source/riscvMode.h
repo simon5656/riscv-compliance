@@ -99,6 +99,20 @@ typedef enum {
 } riscvDMode;
 
 //
+// Active TLB
+//
+typedef enum riscvTLBIdE {
+
+    RISCV_TLB_HS,       // HS TLB
+    RISCV_TLB_VS1,      // VS stage 1 virtual TLB
+    RISCV_TLB_VS2,      // VS stage 2 virtual TLB
+
+    // KEEP LAST: for sizing
+    RISCV_TLB_LAST
+
+} riscvTLBId;
+
+//
 // Processor disable reasons (bitmask)
 //
 typedef enum riscvDisableReasonE {
@@ -295,6 +309,13 @@ inline static riscvMode dmodeToMode3(riscvDMode dMode) {
 //
 inline static Bool modeIsVirtual(riscvMode mode) {
     return (mode>=RISCV_MODE_V) && (mode<RISCV_MODE_LAST);
+}
+
+//
+// Return Supervisor mode for the given mode
+//
+inline static riscvMode getSMode(riscvMode mode) {
+    return modeIsVirtual(mode) ? RISCV_MODE_VS : RISCV_MODE_S;
 }
 
 //
